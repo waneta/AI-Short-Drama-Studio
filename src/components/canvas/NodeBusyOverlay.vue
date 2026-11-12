@@ -1,7 +1,34 @@
 <script setup lang="ts">
-defineProps<{
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+
+const props = defineProps<{
   label?: string
+  startedAt?: number
 }>()
+
+const now = ref(performance.now())
+let timer: ReturnType<typeof setInterval> | undefined
+function stopTimer() {
+  if (timer !== undefined) clearInterval(timer)
+  timer = undefined
+}
+watch(() => props.startedAt, (startedAt) => {
+  stopTimer()
+  now.value = performance.now()
+  if (startedAt != null && Number.isFinite(startedAt)) {
+    timer = setInterval(() => { now.value = performance.now() }, 1000)
+  }
+}, { immediate: true })
+onBeforeUnmount(stopTimer)
+
+const elapsed = computed(() => {
+  if (props.startedAt == null || !Number.isFinite(props.startedAt)) return ''
+  const seconds = Math.max(0, Math.floor((now.value - props.startedAt) / 1000))
+  if (seconds < 60) return `${seconds}秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}分${seconds % 60}秒`
+  return `${Math.floor(minutes / 60)}小时${minutes % 60}分${seconds % 60}秒`
+})
 </script>
 
 <template>
@@ -9,7 +36,7 @@ defineProps<{
     <i class="bar" />
     <i class="scan" />
     <i class="ring" />
-    <span>{{ label || '生成中' }}</span>
+    <span>{{ label || '生成中' }}<span v-if="elapsed" class="elapsed"> · 已耗时 {{ elapsed }}</span></span>
   </div>
 </template>
 

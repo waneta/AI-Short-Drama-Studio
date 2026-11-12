@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useProjectStore, useSettingsStore, uniqueProfileName } from '@/stores'
-import { TTS_VOICES } from '@/services/ai/tts'
+import { compatibleVoice, voicesForModel } from '@/services/ai/tts'
 import EndpointForm from '@/components/settings/EndpointForm.vue'
 import AdapterFields from '@/components/settings/AdapterFields.vue'
 import ComfyQuickAdd from '@/components/settings/ComfyQuickAdd.vue'
@@ -60,8 +60,9 @@ const videoKey = computed({
   get: () => settings.config.video.apiKey,
   set: (v: string) => settings.patchVideo({ apiKey: v })
 })
+const ttsVoices = computed(() => voicesForModel(settings.config.tts.model))
 const ttsVoice = computed({
-  get: () => settings.config.tts.voice,
+  get: () => compatibleVoice(settings.config.tts.model, settings.config.tts.voice),
   set: (v: string) => onVoice(v)
 })
 
@@ -287,7 +288,7 @@ function patchAdapter(
       >
         <label class="extra-label">音色</label>
         <select v-model="ttsVoice">
-          <option v-for="v in TTS_VOICES" :key="v.id" :value="v.id">{{ v.label }}</option>
+          <option v-for="v in ttsVoices" :key="v.id" :value="v.id">{{ v.label }}</option>
         </select>
       </EndpointForm>
       <AdapterFields

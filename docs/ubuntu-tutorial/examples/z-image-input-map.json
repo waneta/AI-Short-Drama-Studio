@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "kind": "text-to-image",
+  "summary": "教材固定规格，仅替换提示词和种子",
+  "bindings": [
+    {
+      "role": "prompt",
+      "nodeId": "4",
+      "field": "text"
+    },
+    {
+      "role": "seed",
+      "nodeId": "8",
+      "field": "seed"
+    },
+    {
+      "role": "width",
+      "nodeId": "6",
+      "field": "width"
+    },
+    {
+      "role": "height",
+      "nodeId": "6",
+      "field": "height"
+    }
+  ],
+  "source": "heuristic",
+  "analyzedAt": 1792540800000
+}

@@ -29,12 +29,20 @@ export const CUSTOM_PROVIDER: ProviderPreset = {
 
 export const LLM_PROVIDERS: ProviderPreset[] = [
   {
+    id: 'dashscope-token-plan',
+    name: '阿里云百炼 Token Plan（订阅）',
+    hint: '使用 Token Plan 套餐专属 Key；不同于普通百炼按量计费接入。',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    models: ['auto', 'qwen3.8-max', 'qwen3.8-flash', 'qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-flash', 'deepseek-v4.1-flash-1017', 'deepseek-v4.1-flash', 'deepseek-v4-pro-0813', 'deepseek-v4-pro', 'deepseek-v4-flash-0731', 'glm-5.3', 'glm-5.2', 'decision-model-preview'],
+    defaultModel: 'qwen3.8-max'
+  },
+  {
     id: 'deepseek',
     name: 'DeepSeek',
     hint: '写剧本 / 智能体。官方 OpenAI 兼容接口。',
     baseUrl: 'https://api.deepseek.com',
-    models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
-    defaultModel: 'deepseek-v4-flash'
+    models: ['deepseek-flash', 'deepseek-v4-pro'],
+    defaultModel: 'deepseek-flash'
   },
   {
     id: 'openai',
@@ -89,6 +97,14 @@ export const LLM_PROVIDERS: ProviderPreset[] = [
 
 export const VISION_PROVIDERS: ProviderPreset[] = [
   {
+    id: 'dashscope-token-plan',
+    name: '阿里云百炼 Token Plan（订阅）',
+    hint: '套餐视觉模型，用于参考图与视频抽帧理解；使用 Token Plan 专属 Key。',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    models: ['qwen3.8-max', 'qwen3.8-flash', 'qwen3.7-plus', 'qwen3.6-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017'],
+    defaultModel: 'qwen3.8-max'
+  },
+  {
     id: 'dashscope',
     name: '阿里云百炼',
     hint: 'Qwen-VL 官方兼容模式。',
@@ -137,16 +153,24 @@ export const IMAGE_PROVIDERS: ProviderPreset[] = [
     name: 'OpenAI',
     hint: '官方 Images API。',
     baseUrl: 'https://api.openai.com/v1',
-    models: ['gpt-image-1', 'dall-e-3'],
+    models: ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini', 'chatgpt-image-latest'],
     defaultModel: 'gpt-image-1'
   },
   {
     id: 'dashscope',
     name: '阿里云百炼',
-    hint: '通义万相 / Qwen-Image 官方。',
-    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    models: ['qwen-image-plus', 'wan2.5-t2i-preview'],
-    defaultModel: 'qwen-image-plus'
+    hint: '千问原生生图与参考图编辑。',
+    baseUrl: 'https://dashscope.aliyuncs.com/api/v1',
+    models: ['qwen-image-3.0-pro', 'wan2.7-image', 'wan2.7-image-pro', 'qwen-image-2.0', 'qwen-image-plus', 'qwen-image-edit-plus'],
+    defaultModel: 'qwen-image-2.0'
+  },
+  {
+    id: 'dashscope-token-plan',
+    name: '阿里云百炼 Token Plan（订阅）',
+    hint: '使用 Token Plan 套餐专属 Key 和地址；不要与按量计费或 Coding Plan 接入混用。',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1',
+    models: ['qwen-image-3.0-pro', 'wan2.7-image', 'wan2.7-image-pro'],
+    defaultModel: 'qwen-image-3.0-pro'
   },
   {
     id: 'zhipu',
@@ -178,6 +202,14 @@ export const IMAGE_PROVIDERS: ProviderPreset[] = [
 
 export const TTS_PROVIDERS: ProviderPreset[] = [
   {
+    id: 'dashscope-token-plan',
+    name: '阿里云百炼 Token Plan（订阅）',
+    hint: '使用 Token Plan 套餐专属 Key；不同于普通百炼按量计费接入。',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1',
+    models: ['qwen-audio-3.0-tts-plus'],
+    defaultModel: 'qwen-audio-3.0-tts-plus'
+  },
+  {
     id: 'dashscope',
     name: '阿里云百炼',
     hint: '口播 TTS 走百炼语音合成，不是 /chat/completions。',
@@ -202,6 +234,14 @@ export const MUSIC_PROVIDERS: ProviderPreset[] = [
 
 export const VIDEO_PROVIDERS: ProviderPreset[] = [
   {
+    id: 'dashscope-token-plan',
+    name: '阿里云百炼 Token Plan（订阅）',
+    hint: '使用 Token Plan 套餐专属 Key；不同于普通百炼按量计费接入。',
+    baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1',
+    models: ['wan3.0-video', 'happyhorse-1.1-i2v', 'happyhorse-1.1-t2v', 'happyhorse-1.1-r2v'],
+    defaultModel: 'wan3.0-video'
+  },
+  {
     id: 'autodl',
     name: 'AutoDL 算力',
     hint: 'H3 图生视频走 AutoDL ComfyUI 工作流，不是海螺官方接口。地址填 https://autodl.art，令牌用 AutoDL Token。',
@@ -213,10 +253,10 @@ export const VIDEO_PROVIDERS: ProviderPreset[] = [
   {
     id: 'dashscope',
     name: '阿里云百炼',
-    hint: '万相视频。节点里选「万相 3.0 Prime」时与配音共用这套百炼 Key。',
+    hint: '万相 2.6 原生视频。节点请选择这条已配置接入，使用这里的 Key。',
     baseUrl: 'https://dashscope.aliyuncs.com/api/v1',
-    models: ['wan2.6-t2v', 'wan2.5-t2v-preview'],
-    defaultModel: 'wan2.6-t2v'
+    models: ['wan2.6-i2v-flash', 'wan2.6-i2v', 'wan2.6-t2v'],
+    defaultModel: 'wan2.6-i2v-flash'
   },
   {
     id: 'apimart',

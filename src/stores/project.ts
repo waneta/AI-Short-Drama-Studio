@@ -8,6 +8,8 @@
 
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
+import { useSettingsStore } from './settings'
+import { pinCanvasGenerationSettings } from '@/services/canvas/nodeGeneration'
 import {
   saveProject,
   loadProject,
@@ -112,6 +114,10 @@ function newProject(): Project {
 
 export const useProjectStore = defineStore('project', () => {
   const current = ref<Project | null>(null)
+  // Bind all loaded/new nodes together before any per-node selector can change a default.
+  watch(() => current.value?.canvas?.nodes, nodes => {
+    if (nodes) pinCanvasGenerationSettings(nodes, useSettingsStore().config)
+  }, { immediate: true, flush: 'sync' })
   const allProjects = ref<Project[]>([])
   const dirty = ref(false)
   const lastSavedAt = ref<number | null>(null)
@@ -566,7 +572,6 @@ export const useProjectStore = defineStore('project', () => {
     node.data = {
       ...node.data,
       prompt,
-      outputAssetId: undefined,
       videoTaskId: undefined
     }
     node.status = 'idle'
@@ -661,13 +666,24 @@ export const useProjectStore = defineStore('project', () => {
         referenceSourceNodeIds: [...(src.data.referenceSourceNodeIds ?? [])],
         duration: src.data.duration ?? 8,
         aspectRatio: src.data.aspectRatio ?? p.settings.aspectRatio,
+        imageProfileId: src.data.imageProfileId,
+        imageModel: src.data.imageModel,
+        generationSeed: src.data.generationSeed,
+        imageResolution: src.data.imageResolution,
+        imageWidth: src.data.imageWidth,
+        imageHeight: src.data.imageHeight,
         ...(type === 'videoGen'
           ? {
               videoModel: normalizeVideoGenModel(src.data.videoModel),
               h3GenMode: normalizeH3GenMode(src.data.h3GenMode),
               firstFrameAssetId: src.data.firstFrameAssetId,
               lastFrameAssetId: src.data.lastFrameAssetId,
-              videoResolution: src.data.videoResolution
+              videoResolution: src.data.videoResolution,
+              videoAudioEnabled: src.data.videoAudioEnabled,
+              referenceAudioAssetId: src.data.referenceAudioAssetId,
+              referenceAudioAssetIds: src.data.referenceAudioAssetIds ? [...src.data.referenceAudioAssetIds] : undefined,
+              videoReferenceOrder: src.data.videoReferenceOrder ? [...src.data.videoReferenceOrder] : undefined,
+              videoProfileId: src.data.videoProfileId
             }
           : {})
       },

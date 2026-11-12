@@ -5,7 +5,8 @@ import { useToastStore } from '@/stores'
 
 const toast = useToastStore()
 
-const baseUrl = ref('http://127.0.0.1:8188')
+const proxyTarget = import.meta.env.VITE_COMFY_PROXY_TARGET
+const baseUrl = ref(proxyTarget || 'http://127.0.0.1:8188')
 const apiKey = ref('')
 const addImage = ref(true)
 const addVideo = ref(true)
@@ -60,6 +61,11 @@ async function onAdd() {
         云端大厂和中转站请使用下面的“API 来源 / Base URL / API Key”。
       </p>
     </header>
+
+    <p v-if="proxyTarget" class="hint">
+      Ubuntu / Web 模式：地址填写 <code>{{ proxyTarget }}</code> 时自动经本机代理连接，无需修改 ComfyUI 的 CORS 设置。
+      改端口请设置 COMFYUI_URL 后重启工作台。
+    </p>
 
     <label>本地 ComfyUI 地址</label>
     <input

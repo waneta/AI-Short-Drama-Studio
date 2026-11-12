@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-21",
+  "sampleProjectImport": true,
+  "threeShotsVisible": true,
+  "comfyAddAndProbe": true,
+  "manualMappingSaved": true,
+  "uiGenerateAndReload": {
+    "width": 1024,
+    "height": 1024,
+    "bytes": 1176203,
+    "generationSeconds": 32.026
+  },
+  "browserFfmpegExport": {
+    "bytes": 71951
+  },
+  "errors": [],
+  "production": {
+    "productionHome": true,
+    "productionFfmpegLoad": true,
+    "productionProxy": true,
+    "errors": []
+  },
+  "baseCommit": "2982dba89086d834c3cf4654e80701ebd2faea12",
+  "branch": "fix/ubuntu-web-comfyui",
+  "checks": [
+    "npm run test:web",
+    "npm run build:web",
+    "git diff --check"
+  ],
+  "h3": "Workflow node types and installed model choices checked; no H3 inference in this task.",
+  "book": {
+    "chapters": 8,
+    "markdownLocalLinks": 47,
+    "htmlLinks": true,
+    "jsonExamples": true,
+    "viewports": [
+      1440,
+      390,
+      320
+    ],
+    "offline": true
+  },
+  "service": {
+    "name": "juliu-studio-web.service",
+    "url": "http://127.0.0.1:5173",
+    "autostart": false
+  }
+}

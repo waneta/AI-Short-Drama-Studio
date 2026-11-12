@@ -261,15 +261,15 @@ async function loadLibraryThumbs() {
   libUrls.value = next
 }
 
-async function uploadLibraryImages() {
+async function uploadLibraryImages(kind: 'image' | 'audio' = 'image') {
   if (libUploading.value) return
   let files: File[]
   try {
-    files = (await pickLocalFiles({ kind: 'image', multiple: true })).filter((f) =>
-      f.type.startsWith('image/')
+    files = (await pickLocalFiles({ kind, multiple: true })).filter((f) =>
+      f.type.startsWith(`${kind}/`)
     )
   } catch (err: any) {
-    toast.error(err?.message || '读取图片失败')
+    toast.error(err?.message || '读取素材失败')
     return
   }
   if (!files.length) return
@@ -278,11 +278,12 @@ async function uploadLibraryImages() {
     for (const file of files) {
       await library.add(file, 'uploaded', {
         filename: file.name,
-        folderId: libFolderId.value
+        folderId: libFolderId.value,
+        kind
       })
     }
     await loadLibraryThumbs()
-    toast.success(`已上传 ${files.length} 张到${currentFolderLabel.value}`)
+    toast.success(`已上传 ${files.length} 项到${currentFolderLabel.value}`)
   } catch (err: any) {
     toast.error(err?.message || '上传失败')
   } finally {
@@ -291,7 +292,7 @@ async function uploadLibraryImages() {
 }
 
 async function removeLibraryItem(id: string) {
-  if (!confirm('从资产库删除这张图？')) return
+  if (!confirm('从资产库删除这份素材？')) return
   await library.remove(id)
   delete libUrls.value[id]
   const next = new Set(libSelected.value)
@@ -377,7 +378,7 @@ async function moveSelectedLibrary() {
           输出一条视频
         </h1>
         <p class="subtitle">
-          桌面端无限画布 + 智能体：人设、分镜、配图、视频都在一张图上连起来。资源存在本地文件夹。
+          无限画布 + 智能体：人设、分镜、配图、视频都在一张图上连起来。{{ isDesktop() ? '资源存在本地文件夹。' : 'Web 版项目与素材保存在当前浏览器，请及时下载备份。' }}
         </p>
         <div class="hero-actions">
           <GradientButton size="lg" type="secondary" @click="openQuickEditor">
@@ -463,10 +464,11 @@ async function moveSelectedLibrary() {
           <HomeIcon class="search-icon" name="search" :size="17" />
           <input v-model="search" class="search" placeholder="搜索项目" />
         </div>
-        <button v-else type="button" class="lib-upload" :disabled="libUploading" @click="uploadLibraryImages">
+        <button v-else type="button" class="lib-upload" :disabled="libUploading" @click="uploadLibraryImages('image')">
           <HomeIcon name="upload" :size="16" />
           {{ libUploading ? '上传中…' : `上传到${currentFolderLabel}` }}
         </button>
+          <button v-if="homeTab === 'library'" type="button" class="lib-upload" :disabled="libUploading" @click="uploadLibraryImages('audio')">上传声音</button>
       </div>
 
       <div v-if="homeTab === 'projects'">
@@ -650,7 +652,7 @@ async function moveSelectedLibrary() {
             "
             :description="
               library.all.length === 0 && libFolderId === LIBRARY_PUBLIC_ID
-                ? '上传图片，或在项目画布里把生成图加入公共库'
+                ? '上传图片或声音，或在项目画布里把生成素材加入公共库'
                 : '上传到这里，或从公共资产勾选后点「转移」'
             "
           >
@@ -663,7 +665,7 @@ async function moveSelectedLibrary() {
               v-for="a in visibleLibraryAssets"
               :key="a.id"
               class="lib-card"
-              :class="{ picked: libSelected.has(a.id) }"
+              :class="{ picked: libSelected.has(a.id), 'is-audio': a.kind === 'audio' }"
             >
               <label class="lib-check">
                 <input
@@ -672,7 +674,11 @@ async function moveSelectedLibrary() {
                   @change="toggleLibSelect(a.id)"
                 />
               </label>
-              <button type="button" class="lib-thumb" @click="libUrls[a.id] && openLightbox(libUrls[a.id], 'image')">
+              <div v-if="a.kind === 'audio'" class="lib-audio">
+                <span>♫ 声音 · {{ fmtDuration(a.duration) }}</span>
+                <audio v-if="libUrls[a.id]" :src="libUrls[a.id]" controls preload="metadata" :aria-label="`试听 ${a.filename}`" />
+              </div>
+              <button v-else type="button" class="lib-thumb" @click="libUrls[a.id] && openLightbox(libUrls[a.id], 'image')">
                 <img v-if="libUrls[a.id]" :src="libUrls[a.id]" alt="" />
                 <span v-else><HomeIcon name="image" :size="30" /></span>
               </button>
@@ -690,6 +696,9 @@ async function moveSelectedLibrary() {
 </template>
 
 <style scoped>
+.lib-card.is-audio { grid-column: span 2; }
+.lib-audio { min-height: 130px; display: flex; flex-direction: column; justify-content: center; gap: 14px; padding: 8px; color: #c4b5fd; }
+.lib-audio audio { width: 100%; min-width: 0; height: 36px; }
 .home {
   height: 100%;
   overflow-y: auto;

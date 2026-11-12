@@ -43,7 +43,8 @@ import {
   synthesizeClonedSpeech
 } from '@/services/ai'
 import { blobToChatImageUrl } from '@/services/ai/client'
-import { imageModelForProject, getVideoPromptStyle } from '@/services/ai/runtime'
+import { isDashScopeEndpoint } from '@/services/ai/dashscopeMedia'
+import { getVideoPromptStyle, getVideoConfig } from '@/services/ai/runtime'
 import { collectShotRefIds, collectShotBoardRefIds, collectShotKeyframeRefIds, collectShotVideoEntries, packVideoRefEntries, boundSubjectIds, sceneAssetForShot, sceneForShot, subjectsForShot, sceneHasKeyProps } from '@/utils/consistency'
 import { resolveShotPlace } from '@/utils/shotPlace'
 import { videoRequiresStoryboard } from '@/utils/storyboardGate'
@@ -82,6 +83,8 @@ import { isPlayApproved, PLAY_GATE_MSG } from './playGate'
 import { generateFinalCut } from './exportFinal'
 import { setActiveProjectDir } from '@/services/storage'
 import { toDigitalHumanWav, extractVideoLastFrame } from '@/services/ffmpeg'
+import { referenceAudioIds, videoReferenceBindings } from './videoReferences'
+import { compileVideoReferenceTokens } from '@/services/ai/videoReferenceTokens'
 import type { AspectRatio, CanvasNode, ID, Project, Scene, Shot, Subject, VideoGenModel, VideoResolution } from '@/types'
 import {
   isH3VideoFamily,
@@ -93,6 +96,22 @@ import {
   videoMinSeconds
 } from '@/types'
 import { canvasReferenceSlotEntries, resolvedCanvasReferenceAssetIds } from '@/services/canvas/references'
+import { isNativeH3VideoProfile, normalizeNativeH3Resolution } from '@/services/ai/nativeH3VideoSettings'
+
+import { h3ImageNodeInput } from '@/services/ai/comfyH3Image'
+import { nodeImageResolution } from './nodeGeneration'
+
+function imageNodeInput(type: CanvasNode['type'], entityId: string) {
+  const node = useProjectStore().current?.canvas?.nodes.find(n => n.type === type &&
+    (n.data.subjectId === entityId || n.data.sceneId === entityId || n.data.shotId === entityId))
+  return imageSettingsForNode(node)
+}
+function imageSettingsForNode(node?: CanvasNode) {
+  const settings = useSettingsStore().config
+  const profile = node?.data.imageProfileId ? settings.images.find(p => p.id === node.data.imageProfileId) : settings.image
+  return { ...h3ImageNodeInput(node?.data), h3Resolution: nodeImageResolution(node?.data, profile),
+    imageProfileId: node?.data.imageProfileId, model: node?.data.imageModel || profile?.model, seed: node?.data.generationSeed }
+}
 
 export type RunProgress = (nodeId: string, msg: string) => void
 export type NodeRunOpts = { hd?: boolean }
@@ -277,7 +296,8 @@ async function saveGeneratedImageToSharedLibrary(
   onProgress?: (msg: string) => void
 ) {
   onProgress?.(`保存到共用资产库 · ${category}...`)
-  return useLibraryStore().addCategorized(blob, category, 'ai-generated', { filename, prompt })
+  const existing = useAssetsStore().all?.find(asset => asset.filename === filename && asset.generation)
+  return useLibraryStore().addCategorized(blob, category, 'ai-generated', { filename, prompt, generation: existing?.generation })
 }
 
 export async function generateSubjectSheet(sub: Subject, onProgress?: (msg: string) => void, signal?: AbortSignal) {
@@ -306,17 +326,18 @@ export async function generateSubjectSheet(sub: Subject, onProgress?: (msg: stri
     {
       prompt,
       style,
+      ...imageNodeInput('subject', latest.id),
       width: size.width,
       height: size.height,
       aspectRatio: '16:9',
       referenceImages: refs.length ? refs : undefined,
       referenceLabels: labels.length ? labels : undefined,
-      model: imageModelForProject(project.current.pipelineMode),
       signal
     },
     onProgress
   )
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `turnaround_${latest.name}_${Date.now().toString(36)}`,
     prompt,
     projectId: project.current.id
@@ -374,17 +395,18 @@ export async function generateScenePropSheet(
     {
       prompt,
       style,
+      ...imageNodeInput('sceneProps', latest.id),
       width: size.width,
       height: size.height,
       aspectRatio: '16:9',
       referenceImages: clippedRefs.length ? clippedRefs : undefined,
       referenceLabels: clippedLabels.length ? clippedLabels : undefined,
-      model: imageModelForProject(project.current.pipelineMode),
       signal
     },
     onProgress
   )
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `scene_props_${latest.name}_${Date.now().toString(36)}`,
     prompt,
     projectId: project.current.id
@@ -420,17 +442,18 @@ export async function generateScenePlate(scn: Scene, onProgress?: (msg: string) 
     {
       prompt,
       style,
+      ...imageNodeInput('scene', latest.id),
       width: size.width,
       height: size.height,
       aspectRatio: '16:9',
       referenceImages: extras.blobs.length ? extras.blobs.slice(0, 10) : undefined,
       referenceLabels: extras.labels.length ? extras.labels.slice(0, 10) : undefined,
-      model: imageModelForProject(project.current.pipelineMode),
       signal
     },
     onProgress
   )
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `anchors_${latest.name}_${Date.now().toString(36)}`,
     prompt,
     projectId: project.current.id
@@ -482,17 +505,18 @@ export async function generateShotBoard(shot: Shot, onProgress?: (msg: string) =
     {
       prompt,
       style,
+      ...imageNodeInput('shotBoard', shot.id),
       width: size.width,
       height: size.height,
       aspectRatio,
       referenceImages: blobs.length ? blobs : undefined,
       referenceLabels: labels.length ? labels : undefined,
-      model: imageModelForProject(project.current.pipelineMode),
       signal
     },
     onProgress
   )
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `board_${shot.index + 1}_${Date.now().toString(36)}`,
     prompt,
     projectId: project.current.id,
@@ -562,17 +586,18 @@ export async function generateShotImage(shot: Shot, onProgress?: (msg: string) =
     {
       prompt,
       style,
+      ...imageNodeInput('shotImage', shot.id),
       width: size.width,
       height: size.height,
       aspectRatio,
       referenceImages: blobs.length ? blobs : undefined,
       referenceLabels: labels.length ? labels : undefined,
-      model: imageModelForProject(project.current.pipelineMode),
       signal
     },
     onProgress
   )
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `shot_${shot.index + 1}_${Date.now().toString(36)}`,
     prompt,
     projectId: project.current.id,
@@ -632,7 +657,9 @@ async function renderShotFrame(
   if (!project.current) throw new Error('没有打开的项目')
   const prompt = shotFrameSendPrompt(shot, project.current, which)
   const look = lookFromScript(project.current.script)
-  const aspectRatio = shotNodeAspect(project.current, shot.id, 'shotImage')
+  const frameNode = project.current.canvas?.nodes.find(n => n.type === 'shotFrames' && n.data.shotId === shot.id)
+  const aspectRatio = frameNode ? canvasNodeAspect(frameNode, project.current.settings.aspectRatio)
+    : shotNodeAspect(project.current, shot.id, 'shotImage')
   const size = imageGenSize('shot', aspectRatio)
   const word = which === 'start' ? '起始帧' : '结束帧'
   onProgress?.(`画这一镜的${word}（${blobs.length} 张人物/场景参考）...`)
@@ -647,12 +674,12 @@ async function renderShotFrame(
       {
         prompt,
         style: look.style,
+        ...imageNodeInput(frameNode ? 'shotFrames' : 'shotImage', shot.id),
         width: size.width,
         height: size.height,
         aspectRatio,
         referenceImages: blobs.length ? blobs : undefined,
         referenceLabels: labels.length ? labels : undefined,
-        model: imageModelForProject(project.current.pipelineMode),
         signal
       },
       onProgress
@@ -665,6 +692,7 @@ async function renderShotFrame(
   if (!quality.passed) throw fail(new Error(`${word}文件无效：${quality.issues.join('；')}`))
   try {
     const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+      generation: result.generation,
       filename: `shot${shot.index + 1}_${which}frame_${Date.now().toString(36)}`,
       prompt,
       projectId: project.current.id,
@@ -923,7 +951,7 @@ async function regenerateDigitalHumanShot(
       audioSync: true,
       promptAsIs: true,
       mode: 'I2VA',
-      videoProfileId: shot.videoProfileId,
+      videoProfileId: canvasVideoProfileForShot(shot),
       signal,
       resumeTaskId: shot.videoTaskId,
       onTaskSubmitted: async (taskId) => {
@@ -937,6 +965,7 @@ async function regenerateDigitalHumanShot(
   const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
   if (!quality.passed) throw new Error(`视频文件无效：${quality.issues.join('；')}`)
   const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+    generation: result.generation,
     filename: `digital_human_${shot.index + 1}_${Date.now().toString(36)}.mp4`,
     prompt: result.prompt,
     projectId: p.id,
@@ -981,6 +1010,10 @@ function canvasVideoNodeForShot(shot: Shot) {
   )
 }
 
+function canvasVideoProfileForShot(shot: Shot) {
+  return canvasVideoNodeForShot(shot)?.data.videoProfileId || shot.videoProfileId
+}
+
 function canvasVideoModelForShot(shot: Shot): VideoGenModel {
   const nodeModel = canvasVideoNodeForShot(shot)?.data.videoModel
   if (nodeModel) return normalizeVideoGenModel(nodeModel)
@@ -991,7 +1024,11 @@ function canvasVideoModelForShot(shot: Shot): VideoGenModel {
 }
 
 function canvasVideoResolutionForShot(shot: Shot, videoModel: VideoGenModel): VideoResolution {
-  return normalizeVideoResolution(canvasVideoNodeForShot(shot)?.data.videoResolution, videoModel)
+  const node = canvasVideoNodeForShot(shot)
+  if (videoModel === 'h3' && isNativeH3VideoProfile(getVideoConfig(node?.data.videoProfileId || shot.videoProfileId))) {
+    return normalizeNativeH3Resolution(node?.data.videoResolution)
+  }
+  return node?.data.videoResolution || normalizeVideoResolution(undefined, videoModel)
 }
 
 function clampVideoDuration(raw: number | undefined, videoModel: VideoGenModel, fallback = 5) {
@@ -1008,7 +1045,8 @@ function storyboardVideoModel(): VideoGenModel {
   if (preferred) return normalizeVideoGenModel(preferred)
   const cfg = useSettingsStore().config.video
   const marker = `${cfg.provider || ''} ${cfg.workflowId || ''} ${cfg.adapter?.type || ''}`.toLowerCase()
-  if (/dashscope|wan/.test(marker)) return 'wan-prime'
+  if (isDashScopeEndpoint(cfg) && !cfg.adapter?.type) return 'h3'
+  if (/wan/.test(marker)) return 'wan-prime'
   if (/h3.*v5/.test(marker) && !/15s/.test(marker)) return 'h3-v5'
   return 'h3'
 }
@@ -1212,9 +1250,39 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
     project.current.pipelineMode === 'smart-speech' &&
     project.current.speechWorkflow?.mode === 'digital-human'
   ) {
+    if (referenceAudioIds(canvasVideoNodeForShot(shot)?.data).length) throw new Error('数字人口播模式使用已生成的口播音频；请移除参考声音，或改用普通H3参考图模式。')
     return regenerateDigitalHumanShot(shot, onProgress, signal)
   }
+  const boundProfile = canvasVideoNodeForShot(shot)?.data.videoProfileId || shot.videoProfileId
+  if (boundProfile) shot = { ...shot, videoProfileId: boundProfile }
+  const audioInput = await videoReferenceAudioInput(canvasVideoNodeForShot(shot))
   const videoModel = canvasVideoModelForShot(shot)
+  const cloudConfig = getVideoConfig(canvasVideoProfileForShot(shot))
+  if (videoModel !== 'wan-prime' && videoModel !== 'h3-v5' && isDashScopeEndpoint(cloudConfig) && !cloudConfig.adapter?.type) {
+    if (shot.h3GenMode === 'fl2va' || project.current.settings.h3ShotChainMode === 'fl2va') throw new Error('百炼单张首帧接入请关闭 H3 首尾帧链模式')
+    const frameId = shot.firstFrameAssetId || shot.imageAssetId
+    const imageBlob = frameId ? await tryLoadRefImageBlob(frameId) : undefined
+    if (cloudConfig.workflowId.includes('i2v') && !imageBlob) throw new Error('请先生成或选用本镜单幅配图作为万相首帧')
+    const result = await generateVideo({
+      ...audioInput,
+      referenceBindings: videoReferenceBindings(frameId ? [frameId] : [], referenceAudioIds(canvasVideoNodeForShot(shot)?.data), canvasVideoNodeForShot(shot)?.data.videoReferenceOrder),
+      imageBlob: imageBlob || undefined, prompt: shot.compiledVideoPrompt!, promptAsIs: true,
+      duration: shot.duration, width: videoSize.width, height: videoSize.height, aspectRatio,
+      videoModel, videoProfileId: canvasVideoProfileForShot(shot), videoResolution: canvasVideoResolutionForShot(shot, videoModel), signal, resumeTaskId: shot.videoTaskId,
+      onTaskSubmitted: async (taskId) => { project.updateShot(shot.id, { videoTaskId: taskId }); await project.save() }
+    }, onProgress)
+    const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
+    if (!quality.passed) throw new Error(`视频文件无效：${quality.issues.join('；')}`)
+    const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+      generation: result.generation,
+      filename: `video_${shot.index + 1}_${Date.now().toString(36)}`, prompt: result.prompt,
+      projectId: project.current.id, shotId: shot.id
+    })
+    project.assignShotVideo(shot.id, asset.id)
+    project.updateShot(shot.id, { videoTaskId: undefined })
+    await project.save()
+    return asset
+  }
   const chainFl2va =
     videoModel !== 'wan-prime' &&
     (project.current.settings.h3ShotChainMode || 'auto') === 'fl2va'
@@ -1296,6 +1364,8 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
       onProgress?.('使用节点上的完整提示词出视频（首尾帧）…')
       const result = await generateVideo(
         {
+          ...audioInput,
+          referenceBindings: videoReferenceBindings([shot.firstFrameAssetId || shot.imageAssetId!, shot.lastFrameAssetId!].filter(Boolean), []),
           imageBlob: firstBlob,
           lastFrameBlob: lastBlob,
           prompt: officialPrompt,
@@ -1318,8 +1388,9 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
           cameraMovement: shot.cameraMovement,
           promptStyle,
           videoModel: 'h3',
-          videoProfileId: shot.videoProfileId,
+          videoProfileId: canvasVideoProfileForShot(shot),
           videoResolution: canvasVideoResolutionForShot(shot, videoModel),
+          videoAudioEnabled: canvasVideoNodeForShot(shot)?.data.videoAudioEnabled,
           h3GenMode: 'fl2va',
           mode: 'I2VA',
           signal,
@@ -1335,6 +1406,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
       const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
       if (!quality.passed) throw new Error(`视频文件无效：${quality.issues.join('；')}`)
       const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+        generation: result.generation,
         filename: `video_${shot.index + 1}_${Date.now().toString(36)}`,
         prompt: result.prompt,
         projectId: project.current.id,
@@ -1455,6 +1527,8 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
   onProgress?.(`生成视频（${slotNames.join('、')}）…`)
   const result = await generateVideo(
     {
+      ...audioInput,
+      referenceBindings: videoReferenceBindings(packed.map(item => item.id), referenceAudioIds(canvasVideoNodeForShot(shot)?.data), canvasVideoNodeForShot(shot)?.data.videoReferenceOrder),
       imageBlob: blobs[0],
       referenceImages: blobs.slice(1),
       prompt: officialPrompt,
@@ -1479,8 +1553,9 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
       cameraMovement: shot.cameraMovement,
       promptStyle,
       videoModel,
-      videoProfileId: shot.videoProfileId,
+      videoProfileId: canvasVideoProfileForShot(shot),
       videoResolution: canvasVideoResolutionForShot(shot, videoModel),
+      videoAudioEnabled: canvasVideoNodeForShot(shot)?.data.videoAudioEnabled,
       h3GenMode: 'reference',
       mode: h3Mode,
       signal,
@@ -1496,6 +1571,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
   const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
   if (!quality.passed) throw new Error(`视频文件无效：${quality.issues.join('；')}`)
   const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+    generation: result.generation,
     filename: `video_${shot.index + 1}_${Date.now().toString(36)}`,
     prompt: result.prompt,
     projectId: project.current.id,
@@ -1544,7 +1620,7 @@ export async function optimizeShotVideoPrompt(shot: Shot, signal?: AbortSignal):
   const scene = sceneForShot(shot, p)
   const place = resolveShotPlace(shot, scene)
   const onScreenNames = cast.map((item) => item.name)
-  const nodeText = (shot.compiledVideoPrompt || '').trim()
+  const nodeText = compileVideoReferenceTokens((shot.compiledVideoPrompt || '').trim(), videoReferenceBindings(packed.map(item => item.id), referenceAudioIds(canvasVideoNodeForShot(shot)?.data), canvasVideoNodeForShot(shot)?.data.videoReferenceOrder), true)
   const usableNodeText = nodeText && !compiledH3PromptNeedsRebuild(nodeText) ? nodeText : ''
   const performance = (shot.videoPrompt || '').trim()
   const brief = shotDirectorBrief(shot, p)
@@ -2423,6 +2499,22 @@ export async function rerunVideoRemake(
   })
 }
 
+async function videoReferenceAudioInput(node?: CanvasNode) {
+  const ids = referenceAudioIds(node?.data)
+  if (!ids.length) return {}
+  if (ids.length > 3) throw new Error('H3最多支持3条参考声音，请减少声音素材。')
+  const assets = useAssetsStore(), library = useLibraryStore()
+  const blobs: Blob[] = [], metadata: Array<{ assetId: string; filename: string }> = []
+  for (const id of ids) {
+    const meta = assets.getMeta(id) || library.getMeta(id)
+    if (meta?.kind !== 'audio') throw new Error('参考声音不存在或不是音频，请重新选择。')
+    const blob = (await assets.getBlob(id)) || (await library.getBlob(id))
+    if (!blob) throw new Error('参考声音无法读取，请重新上传或选择；不会忽略声音继续生成。')
+    blobs.push(blob); metadata.push({ assetId: id, filename: meta.filename })
+  }
+  return { referenceAudioBlobs: blobs, referenceAudios: metadata, referenceAudioBlob: blobs[0], referenceAudio: metadata[0] }
+}
+
 export async function generateFreeformImage(
   nodeId: string,
   onProgress?: (msg: string) => void,
@@ -2440,9 +2532,10 @@ export async function generateFreeformImage(
   onProgress?.('准备参考图...')
   const library = useLibraryStore()
   const blobs: Blob[] = []
-  for (const id of resolvedCanvasReferenceAssetIds(p, node)) {
+  for (const [index, id] of resolvedCanvasReferenceAssetIds(p, node).entries()) {
     const b = (await assets.getBlob(id)) || (await library.getBlob(id))
-    if (b) blobs.push(b)
+    if (!b) throw new Error(`参考图 @${index + 1} 无法读取，请重新上传或选择这张图片；后续参考图不会自动前移。`)
+    blobs.push(b)
   }
   const look = lookFromScript(p.script)
   const aspectRatio = canvasNodeAspect(node, p.settings.aspectRatio)
@@ -2451,14 +2544,15 @@ export async function generateFreeformImage(
   const result = await generateImage({
     prompt,
     style: look.style,
+    ...imageSettingsForNode(node),
     width: size.width,
     height: size.height,
     aspectRatio,
     referenceImages: blobs.length ? blobs : undefined,
-    model: imageModelForProject(p.pipelineMode),
     signal
   })
   const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+    generation: result.generation,
     filename: `${node.data.label || '图片'}.png`,
     prompt,
     projectId: p.id
@@ -2483,15 +2577,19 @@ export async function generateFreeformVideo(
   if (!node) throw new Error('找不到节点')
   const prompt = node.data.prompt ?? ''
   if (!prompt.trim()) throw new Error('请先写提示词')
+  const audioInput = await videoReferenceAudioInput(node)
   const ids = resolvedCanvasReferenceAssetIds(p, node)
   const videoModel = normalizeVideoGenModel(node.data.videoModel)
   const useFl2va = isH3VideoFamily(videoModel) && normalizeH3GenMode(node.data.h3GenMode) === 'fl2va'
+  if (!useFl2va && ids.length > videoMaxRefImages(videoModel)) {
+    throw new Error(`当前视频模型最多支持 ${videoMaxRefImages(videoModel)} 张参考图，请减少参考图；不会自动丢弃多余图片。`)
+  }
   const firstId = node.data.firstFrameAssetId || ids[0]
   const lastId = node.data.lastFrameAssetId || ids[1]
   if (useFl2va) {
     if (!firstId) throw new Error('请先选首帧')
     if (!lastId) throw new Error('请先选尾帧')
-  } else if (!ids.length) {
+  } else if (!ids.length && !audioInput.referenceAudioBlob) {
     throw new Error('请先选至少一张参考图')
   }
   onProgress?.(useFl2va ? '读取首帧和尾帧...' : '读取参考图...')
@@ -2501,13 +2599,10 @@ export async function generateFreeformVideo(
     blobs.push(await loadRefImageBlob(firstId, '首帧'))
     blobs.push(await loadRefImageBlob(lastId, '尾帧'))
   } else {
-    for (const id of ids) {
+    for (const [index, id] of ids.entries()) {
       const b = (await assets.getBlob(id)) || (await library.getBlob(id))
-      if (b) blobs.push(b)
-    }
-    if (!blobs.length) throw new Error('参考图读取失败')
-    if (blobs.length < ids.length) {
-      onProgress?.(`有 ${ids.length - blobs.length} 张参考图读不到，已跳过`)
+      if (!b) throw new Error(`参考图 @${index + 1} 无法读取，请重新上传或选择这张图片；后续参考图不会自动前移。`)
+      blobs.push(b)
     }
   }
   if (p.folderPath) setActiveProjectDir(p.folderPath)
@@ -2525,10 +2620,12 @@ export async function generateFreeformVideo(
   const sendPrompt = prompt
   const result = await generateVideo(
     {
+      ...audioInput,
+      referenceBindings: videoReferenceBindings(useFl2va ? [firstId!, lastId!] : ids, referenceAudioIds(node.data), useFl2va ? [] : node.data.videoReferenceOrder),
       prompt: sendPrompt,
       promptAsIs: true,
       imageBlob: blobs[0],
-      referenceImages: useFl2va ? [] : blobs.slice(1, videoMaxRefImages(videoModel)),
+      referenceImages: useFl2va ? [] : blobs.slice(1),
       lastFrameBlob: useFl2va ? blobs[1] : undefined,
       imageSlots,
       duration,
@@ -2539,7 +2636,10 @@ export async function generateFreeformVideo(
       promptStyle: 'scene-narrative',
       videoModel,
       videoProfileId: node.data.videoProfileId,
-      videoResolution: node.data.videoResolution,
+      seed: node.data.generationSeed,
+      videoResolution: videoModel === 'h3' && isNativeH3VideoProfile(getVideoConfig(node.data.videoProfileId))
+        ? normalizeNativeH3Resolution(node.data.videoResolution) : node.data.videoResolution,
+      videoAudioEnabled: node.data.videoAudioEnabled,
       h3GenMode: useFl2va ? 'fl2va' : 'reference',
       mode: 'R2VA',
       signal,
@@ -2552,6 +2652,7 @@ export async function generateFreeformVideo(
     onProgress
   )
   const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+    generation: result.generation,
     filename: `${node.data.label || '视频'}.mp4`,
     prompt: result.prompt,
     projectId: p.id
@@ -2569,7 +2670,7 @@ export async function optimizeFreeformVideoPrompt(nodeId: string, signal?: Abort
   if (!p) throw new Error('没有打开的项目')
   const node = p.canvas?.nodes.find((n) => n.id === nodeId)
   if (!node || node.type !== 'videoGen') throw new Error('找不到图生视频节点')
-  const source = (node.data.prompt || '').trim()
+  const source = compileVideoReferenceTokens((node.data.prompt || '').trim(), videoReferenceBindings(resolvedCanvasReferenceAssetIds(p, node), referenceAudioIds(node.data), node.data.videoReferenceOrder), true)
   if (!source) throw new Error('请先写提示词')
   const videoModel = normalizeVideoGenModel(node.data.videoModel)
   const aspectRatio = canvasNodeAspect(node, p.settings.aspectRatio)

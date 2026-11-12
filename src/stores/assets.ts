@@ -9,6 +9,7 @@ import { ref, computed } from 'vue'
 import {
   saveAsset,
   loadAssetBlob,
+  loadAsset,
   listAssets,
   deleteAsset,
   loadThumbBlob,
@@ -22,7 +23,7 @@ import {
   ensurePlayableBlob,
   isMostlyDarkImage
 } from '@/services/ffmpeg'
-import type { Asset, ID } from '@/types'
+import type { Asset, ID, GenerationRecord } from '@/types'
 
 export const useAssetsStore = defineStore('assets', () => {
   const all = ref<Asset[]>([])
@@ -43,6 +44,7 @@ export const useAssetsStore = defineStore('assets', () => {
     kind: Asset['kind'],
     source: Asset['source'],
     options: {
+      generation?: GenerationRecord
       filename?: string
       prompt?: string
       projectId?: string
@@ -63,6 +65,7 @@ export const useAssetsStore = defineStore('assets', () => {
       createdAt: Date.now(),
       source,
       prompt: options.prompt,
+      generation: options.generation ? JSON.parse(JSON.stringify(options.generation)) : undefined,
       projectId: options.projectId,
       shotId: options.shotId
     }
@@ -198,7 +201,8 @@ export const useAssetsStore = defineStore('assets', () => {
     const existing = getMeta(id)
     if (existing && existing.kind === kind) return existing
     let blob = await getBlob(id)
-    let meta = existing
+    // Web storage may return library bytes directly; fetch its metadata as well.
+    let meta = existing || await loadAsset(id)
     if (!blob) {
       const { useLibraryStore } = await import('./library')
       const library = useLibraryStore()
@@ -207,6 +211,7 @@ export const useAssetsStore = defineStore('assets', () => {
     }
     if (!blob) throw new Error('素材读取失败')
     return add(blob, kind, meta?.source || 'uploaded', {
+      generation: meta?.generation,
       filename: meta?.filename,
       prompt: meta?.prompt,
       projectId: options.projectId,

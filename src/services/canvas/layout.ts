@@ -323,6 +323,11 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
   function attach(groupId: string, node: CanvasNode) {
     if (!nodes.some((item) => item.id === groupId)) return
     const old = prevAny.get(node.id)
+    if (['subject', 'scene', 'sceneProps', 'shotBoard', 'shotImage', 'shotFrames'].includes(node.type)) {
+      node.data = { imageProfileId: old?.data.imageProfileId, imageModel: old?.data.imageModel,
+        generationSeed: old?.data.generationSeed, imageResolution: old?.data.imageResolution, imageWidth: old?.data.imageWidth,
+        imageHeight: old?.data.imageHeight, ...node.data }
+    }
     const sameParent = old?.parentGroupId === groupId
     if (
       keepPositions &&
@@ -445,8 +450,11 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
       data: {
         shotId: shot.id,
         label: `${i + 1}. ${shot.title}`,
+        generationSeed: prevVid?.data.generationSeed,
         videoModel: prevVid?.data.videoModel ?? defaultVideoModelPref(),
+        videoProfileId: prevVid?.data.videoProfileId ?? shot.videoProfileId,
         videoResolution: prevVid?.data.videoResolution,
+        videoAudioEnabled: prevVid?.data.videoAudioEnabled,
         videoStillMode: resolvedStill,
         aspectRatio: prevVid?.data.aspectRatio ?? project.settings.aspectRatio
       },

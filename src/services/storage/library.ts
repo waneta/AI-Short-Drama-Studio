@@ -1,5 +1,5 @@
 /**
- * 公共资产库：跨项目共享图片
+ * 公共资产库：跨项目共享图片和音频
  * 桌面端：用户所选保存目录/_library/
  * 浏览器：IndexedDB assets（library: true）
  */
@@ -20,6 +20,14 @@ function toPlain<T>(value: T): T {
 function extOf(asset: Pick<Asset, 'kind' | 'mimeType' | 'filename'>): string {
   const fromName = asset.filename?.split('.').pop()?.toLowerCase()
   if (fromName && fromName.length <= 5) return fromName
+  if (asset.kind === 'audio') {
+    if (/wav/.test(asset.mimeType)) return 'wav'
+    if (/mpeg/.test(asset.mimeType)) return 'mp3'
+    if (/ogg/.test(asset.mimeType)) return 'ogg'
+    if (/flac/.test(asset.mimeType)) return 'flac'
+    if (/webm/.test(asset.mimeType)) return 'webm'
+    return 'm4a'
+  }
   if (asset.mimeType.includes('png')) return 'png'
   if (asset.mimeType.includes('webp')) return 'webp'
   if (asset.mimeType.includes('jpeg') || asset.mimeType.includes('jpg')) return 'jpg'
@@ -33,6 +41,7 @@ async function libraryDir(): Promise<string> {
 
 async function ensureLibraryDirs(dir: string) {
   await desktop().writeText(await desktop().join(dir, 'assets', 'images', '.keep'), '')
+  await desktop().writeText(await desktop().join(dir, 'assets', 'audio', '.keep'), '')
   await desktop().writeText(await desktop().join(dir, 'thumbs', '.keep'), '')
 }
 
@@ -71,7 +80,7 @@ export async function saveLibraryAsset(asset: Asset, blob: Blob, thumbBlob?: Blo
   const dir = await libraryDir()
   await ensureLibraryDirs(dir)
   const ext = extOf(stored)
-  const rel = `assets/images/${stored.id}.${ext}`
+  const rel = `assets/${stored.kind === 'audio' ? 'audio' : 'images'}/${stored.id}.${ext}`
   const abs = await desktop().join(dir, rel)
   await desktop().writeBuffer(abs, await bufferFromBlob(blob))
   stored.fileRelPath = rel

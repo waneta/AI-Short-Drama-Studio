@@ -17,6 +17,7 @@ import AssetPicker from '@/components/common/AssetPicker.vue'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
 import VideoResolutionSeg from '@/components/common/VideoResolutionSeg.vue'
+import NativeH3VideoControls from '@/components/common/NativeH3VideoControls.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import {
   normalizeH3GenMode,
@@ -488,6 +489,7 @@ function next() {
           />
         </div>
         <div class="shot-info">
+          <NativeH3VideoControls v-if="!isDigitalHuman" :node-id="shotVideoNodeId(shot)" />
           <div v-if="!isDigitalHuman" class="info-row">
             <VideoModelSelect :model-value="shotVideoModel(shot)" @update:model-value="setShotVideoModel(shot, $event)" />
           </div>

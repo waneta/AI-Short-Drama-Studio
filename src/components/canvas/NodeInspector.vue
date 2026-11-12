@@ -16,7 +16,10 @@ import { pickPlayMarkdownFile } from '@/utils/pickPlayFile'
 import { friendlyAiError, shouldToastAiError } from '@/services/ai/abort'
 import ImageModelSelect from '@/components/settings/ImageModelSelect.vue'
 import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
-import VideoResolutionSeg from '@/components/common/VideoResolutionSeg.vue'
+import GenerationDetails from '@/components/common/GenerationDetails.vue'
+import VideoReferenceEditor from '@/components/canvas/VideoReferenceEditor.vue'
+import AudioReferenceControl from '@/components/canvas/AudioReferenceControl.vue'
+import NativeH3VideoControls from '@/components/common/NativeH3VideoControls.vue'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import TtsModelSelect from '@/components/settings/TtsModelSelect.vue'
@@ -256,13 +259,10 @@ const nodeAspectRatio = computed({
     project.patchCanvasNode(node.id, {
       aspectRatio: v,
       ...(node.type === 'imageGen' || node.type === 'videoGen'
-        ? { outputAssetId: undefined, videoTaskId: undefined }
+        ? { videoTaskId: undefined }
         : {})
     })
-    if (node.type === 'shotVideo' && shot.value) project.invalidateShotAssets(shot.value.id, 'video')
-    else if ((node.type === 'shotImage' || node.type === 'shotBoard') && shot.value) {
-      project.invalidateShotAssets(shot.value.id, 'image')
-    }
+    if (node.type === 'shotVideo' && shot.value) project.updateShot(shot.value.id, { videoTaskId: undefined })
   }
 })
 
@@ -714,7 +714,7 @@ async function optimizeVideoPrompt() {
       </p>
       <p v-else-if="gateBlocked" class="hint">{{ PLAY_GATE_MSG }}</p>
 
-      <AspectRatioSeg v-if="showAspect" v-model="nodeAspectRatio" />
+      <AspectRatioSeg v-if="node.type === 'script'" v-model="nodeAspectRatio" />
 
       <div v-if="preview && (node.type === 'shotVideo' || node.type === 'final')" class="prev prev-video">
         <div class="prev-frame" :style="{ aspectRatio: previewAspect }">
@@ -951,20 +951,12 @@ async function optimizeVideoPrompt() {
         <p class="hint">
           优化按这个框里的原文改写成 H3 格式。你写的台词会进 &lt;d&gt;，口播栏为空也不会删掉。
         </p>
-        <textarea
+        <VideoReferenceEditor v-if="!isH3Fl2va" :node-id="node.id" :model-value="shot.compiledVideoPrompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setShotVideoPrompt(shot!.id, value)" />
+        <textarea v-else
           rows="16"
           :value="shot.compiledVideoPrompt ?? ''"
           :placeholder="videoPromptPlaceholder"
           @input="project.setShotVideoPrompt(shot.id, ($event.target as HTMLTextAreaElement).value)"
-        />
-        <label>时长（秒）</label>
-        <input
-          type="number"
-          :min="videoMinSeconds(videoModel)"
-          :max="videoMaxSeconds(videoModel)"
-          step="1"
-          :value="shot.duration"
-          @change="project.updateShot(shot.id, { duration: Math.min(videoMaxSeconds(videoModel), Math.max(videoMinSeconds(videoModel), Math.round(Number(($event.target as HTMLInputElement).value) || shot.duration))) })"
         />
         <label>运镜</label>
         <select
@@ -1002,9 +994,9 @@ async function optimizeVideoPrompt() {
         :first-hint="node.type === 'shotVideo' && shot?.imageAssetId ? '空则用本镜配图' : ''"
       />
       <ShotRefStrip
-        v-else-if="shot && (node.type === 'shotBoard' || node.type === 'shotImage' || node.type === 'shotVideo')"
+        v-else-if="shot && (node.type === 'shotBoard' || node.type === 'shotImage')"
         :shot="shot"
-        :mode="node.type === 'shotVideo' ? 'video' : node.type === 'shotBoard' ? 'board' : 'image'"
+        :mode="node.type === 'shotBoard' ? 'board' : 'image'"
       />
       <ShotRefStrip
         v-else-if="node.type === 'subject' || node.type === 'sceneProps' || node.type === 'scene'"
@@ -1023,14 +1015,15 @@ async function optimizeVideoPrompt() {
           </button>
         </div>
         <p class="hint">优化按这个框里的原文改写成 H3 格式。只有真正台词进 &lt;d&gt;。</p>
-        <textarea
+        <VideoReferenceEditor v-if="!isH3Fl2va" :node-id="node.id" :model-value="node.data.prompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setCanvasNodePrompt(node!.id, value)" />
+        <textarea v-else
           rows="12"
           :value="node.data.prompt ?? ''"
           placeholder="写视频提示词，描述动作、镜头和声音。"
           @input="project.setCanvasNodePrompt(node.id, ($event.target as HTMLTextAreaElement).value)"
         />
       </template>
-      <div v-if="node.type === 'imageGen' || node.type === 'videoGen'" class="insp-refs">
+      <div v-if="node.type === 'imageGen'" class="insp-refs">
         <div class="lab-row"><label>参考图</label></div>
         <div v-if="inspectorRefIds.length" class="insp-ref-list">
           <div v-for="id in inspectorRefIds" :key="id" class="insp-ref">
@@ -1092,24 +1085,25 @@ async function optimizeVideoPrompt() {
             >
               <img v-if="historyUrls[hid]" :src="historyUrls[hid]" alt="" />
             </button>
+            <GenerationDetails :asset-id="hid" />
             <button class="hist-use" type="button" @click="restoreHistory(hid)">切回</button>
           </div>
         </div>
       </div>
 
-      <div v-if="isImageNode || isVideoNode" class="insp-params">
-        <ImageModelSelect v-if="isImageNode" />
+      <AudioReferenceControl v-if="isVideoNode && isH3Fl2va" :node-id="node.id" />
+      <GenerationDetails v-if="isImageNode || isVideoNode || node.type === 'imageGen'" :asset-id="currentAssetId" :label="node.type === 'shotFrames' ? '首帧结果参数' : '本次结果参数'" />
+      <GenerationDetails v-if="node.type === 'shotFrames' && shot?.lastFrameAssetId && shot.lastFrameAssetId !== shot.firstFrameAssetId" :asset-id="shot.lastFrameAssetId" label="尾帧结果参数" />
+      <div v-if="isImageNode || isVideoNode || node.type === 'imageGen'" class="insp-params">
+        <ImageModelSelect v-if="isImageNode || node.type === 'imageGen'" :node-id="node.id" />
         <VideoModelSelect
+          :node-id="node.id"
           v-if="isVideoNode"
           v-model="videoModel"
           :profile-id="node.data.videoProfileId"
           @select-profile="onSelectVideoProfile"
         />
-        <VideoResolutionSeg
-          v-if="isVideoNode && videoAllows1080p(videoModel) && !isH3Fl2va"
-          v-model="videoResolution"
-          compact
-        />
+        <NativeH3VideoControls v-if="isVideoNode" :node-id="node.id" />
       </div>
       <template v-if="node.type === 'script' && isPlayReady(project.current?.script)">
         <label>续写方向（可选）</label>

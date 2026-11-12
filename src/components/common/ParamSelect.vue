@@ -5,6 +5,7 @@
  */
 withDefaults(
   defineProps<{
+    disabled?: boolean
     label?: string
     modelValue?: string
     /** 固定宽度的下拉（如比例）传窄一点，自适应传 'auto' */
@@ -31,7 +32,7 @@ function onPick(event: Event) {
     }"
   >
     <span v-if="label" class="psel-k">{{ label }}</span>
-    <select :value="modelValue" :title="title || label" @change="onPick">
+    <select :disabled="disabled" :value="modelValue" :title="title || label" @change="onPick">
       <slot />
     </select>
   </label>

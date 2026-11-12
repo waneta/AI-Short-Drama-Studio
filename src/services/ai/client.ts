@@ -9,6 +9,7 @@ import { desktop, isDesktop } from '@/services/desktop'
 import { parseJsonRobust } from '@/utils/jsonRepair'
 import { mockLLM } from './mock'
 import { getAIMode, getLlmConfig, getVisionConfig } from './runtime'
+import { tokenPlanWebProxyUrl } from './tokenPlanWebProxy'
 
 export type LLMContentPart =
   | { type: 'text'; text: string }
@@ -227,7 +228,8 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
         json: async () => JSON.parse(res.text || '{}')
       }
     }
-    const resp = await fetch(url, {
+    const requestUrl = tokenPlanWebProxyUrl(url, import.meta.env.VITE_TOKEN_PLAN_WEB_PROXY === 'true', isDesktop())
+    const resp = await fetch(requestUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

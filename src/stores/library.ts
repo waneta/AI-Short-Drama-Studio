@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
   listLibraryAssets,
+  loadAsset,
   saveLibraryAsset,
   loadLibraryAssetBlob,
   deleteLibraryAsset,
@@ -13,7 +14,7 @@ import {
 import { isDesktop, assetFileUrl } from '@/services/desktop'
 import { libraryAssetAbsPath } from '@/services/storage'
 import { probeMedia, ensurePlayableBlob } from '@/services/ffmpeg'
-import type { Asset, ID, LibraryFolder } from '@/types'
+import type { Asset, ID, LibraryFolder, GenerationRecord } from '@/types'
 
 /** 公共资产（未分类）在 UI 里用这个 id */
 export const LIBRARY_PUBLIC_ID = 'public'
@@ -49,27 +50,29 @@ export const useLibraryStore = defineStore('library', () => {
   async function add(
     blob: Blob,
     source: Asset['source'],
-    options: { filename?: string; prompt?: string; folderId?: string } = {}
+    options: { generation?: GenerationRecord; filename?: string; prompt?: string; folderId?: string; kind?: 'image' | 'audio' } = {}
   ): Promise<Asset> {
-    const typed = await ensurePlayableBlob(blob, 'image')
+    const kind = options.kind || (blob.type.startsWith('audio/') ? 'audio' : 'image')
+    const typed = await ensurePlayableBlob(blob, kind)
     const info = await probeMedia(typed)
-    const id = `image_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+    const id = `${kind}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
     const folderId =
       options.folderId && options.folderId !== LIBRARY_PUBLIC_ID ? options.folderId : undefined
-    const asset: Asset = {
+    const base = {
       id,
-      kind: 'image',
-      mimeType: typed.type || 'image/png',
+      mimeType: typed.type || (kind === 'audio' ? 'audio/wav' : 'image/png'),
       filename: options.filename ?? `library_${id}`,
       size: typed.size,
       createdAt: Date.now(),
       source,
       prompt: options.prompt,
+      generation: options.generation ? JSON.parse(JSON.stringify(options.generation)) : undefined,
       library: true,
-      folderId,
-      width: info.width,
-      height: info.height
+      folderId
     }
+    const asset: Asset = kind === 'audio'
+      ? { ...base, kind, duration: info.duration ?? 0 }
+      : { ...base, kind, width: info.width, height: info.height }
     await saveLibraryAsset(asset, typed)
     await refresh()
     return asset
@@ -77,12 +80,15 @@ export const useLibraryStore = defineStore('library', () => {
 
   async function publishFrom(
     assetId: ID,
-    meta?: { filename?: string; prompt?: string }
+    meta?: { generation?: GenerationRecord; filename?: string; prompt?: string }
   ): Promise<Asset> {
     const blob = await loadAssetBlob(assetId)
-    if (!blob) throw new Error('读不到这张图')
+    if (!blob) throw new Error('读不到这份素材')
+    const original = await loadAsset(assetId)
     return add(blob, 'ai-generated', {
-      filename: meta?.filename,
+      kind: original?.kind === 'audio' ? 'audio' : 'image',
+      filename: meta?.filename || original?.filename,
+      generation: meta?.generation || original?.generation,
       prompt: meta?.prompt
     })
   }
@@ -90,7 +96,8 @@ export const useLibraryStore = defineStore('library', () => {
   async function getUrl(id: ID): Promise<string | undefined> {
     const cached = urlCache.get(id)
     if (cached) return cached
-    if (isDesktop()) {
+    // Audio needs a blob URL for reliable playback and seeking on desktop too.
+    if (isDesktop() && getMeta(id)?.kind !== 'audio') {
       const abs = await libraryAssetAbsPath(id)
       if (abs) {
         const url = assetFileUrl(abs)
@@ -168,7 +175,7 @@ export const useLibraryStore = defineStore('library', () => {
     blob: Blob,
     category: '角色' | '场景' | '道具' | '其他',
     source: Asset['source'],
-    options: { filename?: string; prompt?: string } = {}
+    options: { generation?: GenerationRecord; filename?: string; prompt?: string } = {}
   ): Promise<Asset> {
     const folder = await ensureFolder(category)
     return add(blob, source, { ...options, folderId: folder.id })

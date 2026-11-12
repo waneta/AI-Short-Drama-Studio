@@ -1,0 +1,88 @@
+{
+  "imports": [
+    {
+      "name": "忘带钥匙 · 漫剧练习",
+      "shots": 3,
+      "subjects": 1,
+      "scenes": 1
+    },
+    {
+      "name": "雨中的伞 · 漫剧练习",
+      "shots": 5,
+      "subjects": 2,
+      "scenes": 1
+    },
+    {
+      "name": "迟到的约定 · 漫剧练习",
+      "shots": 8,
+      "subjects": 2,
+      "scenes": 2
+    },
+    {
+      "name": "门后的来客 · 漫剧练习",
+      "shots": 12,
+      "subjects": 2,
+      "scenes": 2
+    }
+  ],
+  "viewports": [
+    {
+      "width": 1440,
+      "body": 1440,
+      "viewport": 1440,
+      "sections": 17
+    },
+    {
+      "width": 390,
+      "body": 390,
+      "viewport": 390,
+      "sections": 17
+    },
+    {
+      "width": 320,
+      "body": 320,
+      "viewport": 320,
+      "sections": 17
+    }
+  ],
+  "errors": [],
+  "offline": true,
+  "singleFramePrompt": true,
+  "pipeline": {
+    "videos": 3,
+    "clearedTaskIds": true
+  },
+  "persisted": true,
+  "export": {
+    "bytes": 3179117,
+    "synthetic": true,
+    "captionBurnIn": true
+  },
+  "date": "2026-10-21",
+  "cloudModelsExecuted": false,
+  "localH3Executed": false,
+  "checks": [
+    "npm run test:tutorial-media",
+    "npm run test:web",
+    "npm run build:web",
+    "python docs/ubuntu-tutorial/tools/check_book.py",
+    "git diff --check"
+  ],
+  "exportProbe": {
+    "duration": 15.07,
+    "width": 640,
+    "height": 360,
+    "fps": 24,
+    "video": "h264",
+    "audio": "aac"
+  },
+  "previousValidation": "validation-local-baseline.json",
+  "fullBuildPassed": true,
+  "bookChecks": {
+    "markdownLocalLinks": 100,
+    "htmlLocalLinks": 117,
+    "cases": 4,
+    "shots": 28
+  },
+  "workbenchUrl": "http://127.0.0.1:5173"
+}

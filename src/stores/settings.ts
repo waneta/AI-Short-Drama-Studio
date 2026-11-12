@@ -6,6 +6,9 @@
 
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
+import { applyStartupVideoProfile } from '@/services/settings/startupVideoProfile'
+import { applyStartupImageProfile, retireUninstalledImageProfiles } from '@/services/settings/startupImageProfile'
+import { repairImageEndpoint, repairImageProfiles } from '@/services/settings/repairImageProfiles'
 import { envDefaults, migrateVideoBaseUrl, migrateVideoWorkflowId } from '@/services/ai/env'
 import { desktop, isDesktop } from '@/services/desktop'
 import { stillModeForVideoModel, type VideoGenModel, type VideoStillMode } from '@/types/canvas'
@@ -98,6 +101,9 @@ export interface AppSettings {
   video: VideoEndpoint
   videos: VideoProfile[]
   activeVideoId: string
+  /** Explicit deployment profiles already applied; preserve later user choices. */
+  appliedStartupVideoProfileIds?: string[]
+  appliedStartupImageProfileIds?: string[]
   /**
    * 创作偏好里选的默认视频模型（内置工作流：h3 / h3-v5 / wan-prime）。
    * undefined = 跟随「已配置的视频接入」（activeVideoId）。节点上单独选过的模型优先于它。
@@ -277,6 +283,7 @@ function hydrateNamed(
           {
             ...fallback,
             ...p,
+            ...(prefix === 'img' ? { adapter: p.adapter } : {}),
             models: uniq([...(p.models ?? []), ...(p.model ? [p.model] : [])])
           },
           p.name,
@@ -431,25 +438,18 @@ function parseSettings(raw: string | null): AppSettings {
   try {
     const parsed = JSON.parse(raw) as Partial<AppSettings>
     const savedLlm = parsed.llm
-    const legacyQwenPrimary = /^qwen/i.test(savedLlm?.model ?? '')
-    const llmSnap = legacyQwenPrimary
-      ? defaults.llm
-      : {
-          ...defaults.llm,
-          ...savedLlm,
-          models: uniq([...(savedLlm?.models ?? []), ...defaults.llm.models]).filter(
-            (model) => !/^qwen/i.test(model)
-          )
-        }
+    const llmSnap = {
+      ...defaults.llm,
+      ...savedLlm,
+      model: savedLlm?.model || defaults.llm.model,
+      models: uniq([...(savedLlm?.models ?? []), ...defaults.llm.models])
+    }
     const savedVision = parsed.vision
-    const legacyTextOnlyVision = /^(qwen3\.7|qwen-vl-)/i.test(savedVision?.model ?? '')
     const visionSnap = {
       ...defaults.vision,
       ...savedVision,
-      model: legacyTextOnlyVision ? defaults.vision.model : (savedVision?.model || defaults.vision.model),
-      models: uniq([...(savedVision?.models ?? []), ...defaults.vision.models]).filter(
-        (model) => !/^(qwen3\.7|qwen-vl-)/i.test(model)
-      )
+      model: savedVision?.model || defaults.vision.model,
+      models: uniq([...(savedVision?.models ?? []), ...defaults.vision.models])
     }
     const llm = hydrateNamed(parsed.llms, llmSnap, '默认 LLM', parsed.activeLlmId, 'llm')
     const vision = hydrateNamed(parsed.visions, visionSnap, '默认视觉', parsed.activeVisionId, 'vis')
@@ -604,7 +604,18 @@ function writeDisk(v: AppSettings) {
 }
 
 export const useSettingsStore = defineStore('settings', () => {
-  const config = ref<AppSettings>(loadFromLocal())
+  const saved = loadFromLocal()
+  const repaired = repairImageProfiles(saved)
+  const withVideo = isDesktop() ? repaired : applyStartupVideoProfile(repaired, import.meta.env.VITE_STARTUP_VIDEO_PROFILE || '')
+  const withImage = isDesktop() ? withVideo : applyStartupImageProfile(withVideo, import.meta.env.VITE_STARTUP_IMAGE_PROFILE || '')
+  const imageFallback = () => {
+    const defaults = buildDefaults()
+    const seeded = isDesktop() ? defaults : applyStartupImageProfile(defaults, import.meta.env.VITE_STARTUP_IMAGE_PROFILE || '')
+    return seeded.images.find(profile => profile.id === seeded.activeImageId) || seeded.images[0]!
+  }
+  const initial = retireUninstalledImageProfiles(withImage, imageFallback)
+  if (initial !== saved) writeLocal(initial)
+  const config = ref<AppSettings>(initial)
   const persistPath = ref('')
   const diskReady = ref(false)
   const lastSavedAt = ref(0)
@@ -653,7 +664,7 @@ export const useSettingsStore = defineStore('settings', () => {
         if (raw) {
           skipDisk = true
           if (!userEdited) {
-            config.value = parseSettings(raw)
+            config.value = retireUninstalledImageProfiles(repairImageProfiles(parseSettings(raw)), imageFallback)
             writeLocal(config.value)
           }
           skipDisk = false
@@ -863,7 +874,7 @@ export const useSettingsStore = defineStore('settings', () => {
     const cur =
       config.value.images.find((p) => p.id === id) ||
       profileFromEndpoint(config.value.image, '默认生图', id)
-    syncImage({ ...cur, ...patch, models: uniq(patch.models ?? cur.models) })
+    syncImage(repairImageEndpoint({ ...cur, ...patch, models: uniq(patch.models ?? cur.models) }))
   }
 
   function addImage(seed: {

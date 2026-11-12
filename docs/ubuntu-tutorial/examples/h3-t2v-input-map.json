@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "kind": "text-to-video",
+  "summary": "教材固定规格，仅替换提示词和种子",
+  "bindings": [
+    {
+      "role": "prompt",
+      "nodeId": "5",
+      "field": "prompt"
+    },
+    {
+      "role": "seed",
+      "nodeId": "7",
+      "field": "noise_seed"
+    }
+  ],
+  "source": "heuristic",
+  "analyzedAt": 1792540800000
+}

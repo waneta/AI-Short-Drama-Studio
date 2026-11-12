@@ -1,3 +1,6 @@
+import { generationRecord } from './generationRecord'
+import { isNativeH3VideoProfile } from './nativeH3VideoSettings'
+import type { GenerationRecord } from '@/types'
 /**
  * AI 视频生成（AutoDL.art ComfyUI 工作流 API）
  *
@@ -10,6 +13,7 @@
  */
 
 import { getAIMode } from './client'
+import { dashscopeVideo, isDashScopeEndpoint } from './dashscopeMedia'
 import { comfyPromptGenerate, httpCustomMediaGenerate, isApimartHost, resolveVideoAdapter } from './adapters'
 import { apimartGenerateVideo, isApimartEndpoint } from './apimart'
 import { autodlVideoProfileId, getVideoConfig, getVideoPromptStyle, getTtsConfig } from './runtime'
@@ -32,6 +36,9 @@ import { blobFromPath, desktop, isDesktop } from '@/services/desktop'
 import { isLandscapeAspect } from '@/utils/aspect'
 import { toDigitalHumanWav } from '@/services/ffmpeg'
 import { normalizeZealmanBaseUrl, zealmanWorkflowById } from './zealman'
+import { compileVideoReferenceTokens, type VideoReferenceBinding } from './videoReferenceTokens'
+import { resolveImageReferenceMentions } from './imageReferenceMentions'
+import { prepareComfyVideoWorkflow } from './comfyVideoReference'
 
 export interface VideoGenInput {
   /** 第一张参考图：角色设计图 / 场景图 / 故事看板之一，不是人物+场景配图 */
@@ -42,7 +49,7 @@ export interface VideoGenInput {
    * 发给出视频接口的提示词。promptAsIs 为真时不再编译/拼接。
    */
   prompt: string
-  /** 框里的全文原样发送，不再套 H3 模板 */
+  /** 不套 H3 模板；仅把用户显式的 @N 引用转为供应商编号 */
   promptAsIs?: boolean
   /**
    * 项目级整体氛围（中文，1-2 段）
@@ -88,12 +95,21 @@ export interface VideoGenInput {
   videoModel?: VideoGenModel
   /** 锁定设置中的视频接入，生成时不能回落到另一个供应商。 */
   videoProfileId?: string
-  /** h3-v5 可选 1080p */
+  seed?: number
+  /** 原生H3三档清晰度；云端h3-v5保留其原有档位。 */
   videoResolution?: VideoResolution
+  /** 原生H3成片是否包含音轨；关闭仍保留模型联合采样。 */
+  videoAudioEnabled?: boolean
   /** H3：参考图生成或首尾帧。默认参考图。 */
   h3GenMode?: H3VideoGenMode
   /** 首尾帧模式的尾帧图 */
   lastFrameBlob?: Blob
+  /** Standalone reference sound for native H3 Ref2VA; does not force lip sync. */
+  referenceAudioBlob?: Blob
+  referenceAudioBlobs?: Blob[]
+  referenceAudios?: Array<{ assetId?: string; filename?: string }>
+  referenceBindings?: VideoReferenceBinding[]
+  referenceAudio?: { assetId?: string; filename?: string }
   /** 数字人口播：与画面同步的口播音频 */
   audioBlob?: Blob
   /** 走 MiniMax H3 图+音频同步工作流 */
@@ -107,6 +123,7 @@ export interface VideoGenInput {
 }
 
 export interface VideoGenOutput {
+  generation?: GenerationRecord
   blob: Blob
   mimeType: string
   prompt: string
@@ -598,7 +615,7 @@ async function realWorkflowVideo(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
-  const cfg = getVideoConfig(input.videoProfileId)
+  const cfg = videoConfig(input)
   const baseUrl = migrateVideoBaseUrl(cfg.baseUrl || VIDEO_AUTODL_ROOT)
   const apiKey = cfg.apiKey
   const isFl2va = input.h3GenMode === 'fl2va'
@@ -807,7 +824,8 @@ async function realWorkflowVideo(
     if (picked) {
       log(`✓ 已拿到视频地址 (${phase || 'no-status'}): ${picked.url}`)
       onProgress?.('下载视频...')
-      return await downloadGeneratedVideo(picked.url, input.signal, finalPrompt, targetDuration, onProgress)
+      const result = await downloadGeneratedVideo(picked.url, input.signal, finalPrompt, targetDuration, onProgress)
+      return { ...result, generation: { ...generationRecord('video', cfg, input), model: workflowId, resolution, prompt: finalPrompt, promptId: taskId } }
     }
     if (phase === 'queued') {
       successEmptySince = 0
@@ -1025,10 +1043,19 @@ function inferH3Mode(input: VideoGenInput): 'I2VA' | 'T2VA' | 'R2VA' {
   return 'T2VA'
 }
 
-function buildPrompt(input: VideoGenInput): string {
-  // promptAsIs 是不可绕过的用户契约：任何模式都必须逐字发送输入框内容。
-  if (input.promptAsIs) return input.prompt
-  const raw =
+function buildPrompt(input: VideoGenInput, nativeH3 = input.videoModel !== 'wan-prime'): string {
+  const count = input.h3GenMode === 'fl2va'
+    ? Number(Boolean(input.imageBlob)) + Number(Boolean(input.lastFrameBlob))
+    : Number(Boolean(input.imageBlob)) + (input.audioSync ? 0 : input.referenceImages?.length || 0)
+  // Preserve caller upload order. Node bindings also carry the visible mixed-material number.
+  const bindings = input.referenceBindings ?? [
+    ...Array.from({ length: count }, (_, index) => ({ id: `image-slot-${index}`, kind: 'image' as const })),
+    ...Array.from({ length: input.referenceAudioBlobs?.length || Number(Boolean(input.referenceAudioBlob)) }, (_, index) => ({ id: `audio-slot-${index}`, kind: 'audio' as const }))
+  ]
+  // Generation only compiles explicit references; it never rewrites the user's prose.
+  const resolveMentions = (prompt: string) => resolveImageReferenceMentions(compileVideoReferenceTokens(prompt, bindings, nativeH3), count, nativeH3 ? 'h3' : false)
+  if (input.promptAsIs) return resolveMentions(input.prompt)
+  const raw = resolveMentions(
     input.videoModel === 'wan-prime'
       ? input.prompt
       : composeH3VideoPrompt({
@@ -1055,7 +1082,7 @@ function buildPrompt(input: VideoGenInput): string {
           cameraMovement: input.cameraMovement,
           mode: inferH3Mode(input),
           promptStyle: input.promptStyle ?? getVideoPromptStyle()
-        })
+        }))
   if (input.h3GenMode === 'fl2va' && input.videoModel !== 'wan-prime') {
     return ensureFl2vaLead(raw, input.duration)
   }
@@ -1066,7 +1093,7 @@ async function realApimartVideo(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
-  const cfg = getVideoConfig(input.videoProfileId)
+  const cfg = videoConfig(input)
   if (!cfg.apiKey) {
     throw new Error('[video] 这条 APIMart 视频接入还没有自己的 API Key。不会使用 AutoDL 令牌。')
   }
@@ -1100,7 +1127,7 @@ async function realHttpCustomVideo(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
-  const cfg = getVideoConfig(input.videoProfileId)
+  const cfg = videoConfig(input)
   if (!cfg.baseUrl) throw new Error('[video] 未配置自定义视频接口地址')
   const modelName = String(cfg.workflowId || '').trim()
   if (isApimartHost(cfg.baseUrl) && !modelName) {
@@ -1140,7 +1167,7 @@ async function realZealmanVideo(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
-  const cfg = getVideoConfig(input.videoProfileId)
+  const cfg = videoConfig(input)
   const configuredRoot = String(cfg.zealmanBaseUrl || cfg.baseUrl || '').trim()
   const root = normalizeZealmanBaseUrl(configuredRoot) || configuredRoot.replace(/\/+$/, '')
   const workflow = zealmanWorkflowById(cfg.workflowId || '')
@@ -1243,42 +1270,59 @@ async function realComfyNativeVideo(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
-  const cfg = getVideoConfig(input.videoProfileId)
+  const cfg = videoConfig(input)
   if (!cfg.baseUrl) throw new Error('[video] 未配置自建 ComfyUI 地址')
   onProgress?.('自建 ComfyUI 出视频…')
-  const prompt = buildPrompt(input)
-  let imageDataUrl: string | undefined
-  if (input.imageBlob) imageDataUrl = await blobToDataUrl(input.imageBlob)
+  if (!cfg.adapter?.workflowTemplate?.trim()) {
+    throw new Error('[video] 自建 ComfyUI 需要配置 API 工作流与输入映射。')
+  }
+  const isFl2va = input.h3GenMode === 'fl2va'
+  const images = [input.imageBlob, ...(!isFl2va && !input.audioSync ? input.referenceImages || [] : [])]
+    .filter((blob): blob is Blob => Boolean(blob))
+  if (isFl2va && input.referenceImages?.length) throw new Error('[video] 首尾帧模式只使用首帧和尾帧，其他参考图请选择参考图生成模式。')
+  if (input.audioSync && input.referenceImages?.length) throw new Error('[video] 音频同步工作流需单独配置多图输入，不能忽略额外参考图。')
+  const prepared = input.audioSync ? { adapter: cfg.adapter, nativeH3: true } : prepareComfyVideoWorkflow(cfg.adapter, {
+    mode: isFl2va ? 'fl2va' : input.mode === 'I2VA' && input.h3GenMode !== 'reference' ? 'first' : 'reference',
+    count: images.length, width: input.width, height: input.height, duration: input.duration,
+    resolution: input.videoResolution, audioEnabled: input.videoAudioEnabled, referenceAudioCount: input.referenceAudioBlobs?.length || Number(Boolean(input.referenceAudioBlob))
+  })
+  const prompt = buildPrompt(input, prepared.nativeH3)
+  const imageDataUrls: string[] = []
+  for (const image of images) imageDataUrls.push(await blobToDataUrl(image))
   let imageEndDataUrl: string | undefined
   if (input.lastFrameBlob) imageEndDataUrl = await blobToDataUrl(input.lastFrameBlob)
-  let audioDataUrl: string | undefined
-  if (input.audioBlob) audioDataUrl = await blobToDataUrl(input.audioBlob)
-  if (!cfg.adapter?.workflowTemplate?.trim()) {
-    throw new Error(
-      '[video] 自建 ComfyUI 需要在接入的 adapter.workflowTemplate 里粘贴 Comfy「Save (API Format)」导出的 JSON，并让助手分析出输入映射（首帧 / 提示词写到哪个节点）。AutoDL 云端请用 comfyui-workflow 适配器。'
-    )
-  }
-  const { blob, mimeType } = await comfyPromptGenerate({
+  const audioBlobs = input.referenceAudioBlobs?.length ? input.referenceAudioBlobs : input.referenceAudioBlob ? [input.referenceAudioBlob] : input.audioBlob ? [input.audioBlob] : []
+  const audioDataUrls: string[] = []
+  for (const audio of audioBlobs) audioDataUrls.push(await blobToDataUrl(audio))
+  onProgress?.(isFl2va ? '首尾帧已准备：2 张' : `参考图已准备：${images.length} 张，按 @1、@2 顺序提交`)
+  const { blob, mimeType, generation } = await comfyPromptGenerate({
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,
     prompt,
-    imageDataUrl,
+    imageDataUrls,
     imageEndDataUrl,
-    audioDataUrl,
-    adapter: cfg.adapter,
+    audioDataUrls,
+    adapter: prepared.adapter,
+    seed: input.seed,
+    generationTimeoutMs: prepared.nativeH3 ? 60 * 60_000 : undefined,
     signal: input.signal,
     kind: 'video',
     onProgress
   })
-  return { blob, mimeType, prompt, duration: input.duration }
+  return { blob, mimeType, prompt, duration: input.duration, generation: generation as GenerationRecord }
 }
 
-export async function generateVideo(
+async function runVideoGeneration(
   input: VideoGenInput,
   onProgress?: (msg: string) => void
 ): Promise<VideoGenOutput> {
   const mode = getAIMode()
   if (mode === 'real') {
+    const selected = videoConfig(input)
+    if (input.videoModel !== 'wan-prime' && input.videoModel !== 'h3-v5' && isDashScopeEndpoint(selected) && !selected.adapter?.type) {
+      if (input.audioSync || input.h3GenMode === 'fl2va') throw new Error('[百炼] 当前接入使用单张首帧，请关闭 H3 音频同步或首尾帧模式')
+      return await dashscopeVideo(selected, input, onProgress)
+    }
     if (input.audioSync) {
       if (!input.imageBlob || !input.audioBlob) {
         throw new Error('[video] 数字人口播需要人物参考图和对应音频')
@@ -1290,7 +1334,7 @@ export async function generateVideo(
     } else if (!input.imageBlob) {
       const peekId = input.videoModel === 'h3-v5' ? autodlVideoProfileId() || input.videoProfileId : input.videoProfileId
       const peek = getVideoConfig(peekId)
-      if (!isApimartEndpoint(peek.baseUrl, peek.provider)) {
+      if (!isApimartEndpoint(peek.baseUrl, peek.provider) && resolveVideoAdapter(peek) !== 'comfyui-prompt') {
         throw new Error('[video] 真实模式需要至少一张参考图')
       }
     }
@@ -1298,10 +1342,8 @@ export async function generateVideo(
     if (input.videoModel === 'wan-prime') {
       return await realWanVideo(input, onProgress)
     }
-    const request = input.videoModel === 'h3-v5'
-      ? { ...input, videoProfileId: autodlVideoProfileId() || input.videoProfileId }
-      : input
-    const vcfg = getVideoConfig(request.videoProfileId)
+    const request = input
+    const vcfg = videoConfig(request)
     if (isApimartEndpoint(vcfg.baseUrl, vcfg.provider)) {
       return await realApimartVideo(request, onProgress)
     }
@@ -1349,4 +1391,34 @@ export async function generateVideo(
     input.cameraMovement
   )
   return { blob, mimeType: 'video/webm', prompt: buildPrompt(input), duration: input.duration }
+}
+
+const resolvedVideoConfigs = new WeakMap<VideoGenInput, ReturnType<typeof getVideoConfig>>()
+function videoConfig(input: VideoGenInput) {
+  return resolvedVideoConfigs.get(input) || getVideoConfig(input.videoProfileId)
+}
+export async function generateVideo(input: VideoGenInput, onProgress?: (msg: string) => void): Promise<VideoGenOutput> {
+  const startedAt = performance.now()
+  const id = input.videoModel === 'h3-v5' ? input.videoProfileId || autodlVideoProfileId() : input.videoProfileId
+  if (input.videoModel === 'h3-v5' && !id) throw new Error('内置H3 v5需要配置AutoDL接入，请先配置或选择具体视频接入。')
+  const cfg: ReturnType<typeof getVideoConfig> = JSON.parse(JSON.stringify(getVideoConfig(id)))
+  if (input.videoModel === 'h3-v5' && cfg.provider !== 'autodl' && !/autodl\.art/i.test(cfg.baseUrl)) throw new Error('内置H3 v5不能使用当前接入，请选择AutoDL模型接入。')
+  const request = { ...input, videoProfileId: cfg.id || id, promptStyle: input.promptStyle || cfg.promptStyle }
+  resolvedVideoConfigs.set(request, cfg)
+  if (request.referenceAudioBlob || request.referenceAudioBlobs?.length) {
+    if ((request.referenceAudioBlobs?.length || 1) > 3) throw new Error('H3最多支持3条参考声音，不会丢弃多余声音。')
+    if (request.videoModel === 'wan-prime' || request.videoModel === 'h3-v5' || !isNativeH3VideoProfile(cfg)) throw new Error('当前视频模型不支持参考声音，请选择本地 MiniMax H3 参考图模式，或移除参考声音。')
+    if (request.audioSync || request.h3GenMode === 'fl2va') throw new Error('参考声音需要 H3「参考图」模式，请切换模式或移除参考声音。')
+  }
+  const record = generationRecord('video', cfg, request)
+  if (isNativeH3VideoProfile(cfg)) record.model = 'MiniMax H3 Video'
+  if (input.videoModel === 'wan-prime') { record.model = WAN_PRIME_MODEL; record.profileName = '百炼 TTS 接入令牌'; record.profileId = undefined; record.resolution = '720p' }
+  try {
+    const result = await runVideoGeneration(request, onProgress)
+    // A resumed old task cannot be attributed to the retry's current controls.
+    const generation = input.resumeTaskId ? { version: 1 as const, kind: 'video' as const,
+      createdAt: Date.now(), model: '未记录（续查旧任务）', prompt: '', parametersUnknown: true } : { ...record, ...result.generation, prompt: result.generation?.prompt || result.prompt,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)) }
+    return { ...result, generation }
+  } finally { resolvedVideoConfigs.delete(request) }
 }

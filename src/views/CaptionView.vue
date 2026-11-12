@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { useProjectStore, useToastStore, useAssetsStore } from '@/stores'
+import { useProjectStore, useToastStore, useAssetsStore, useSettingsStore } from '@/stores'
 import { buildCuesFromClips, parseSRT, renderCaptionPng, toSRT } from '@/services/ffmpeg'
-import { generateSpeech, TTS_VOICES } from '@/services/ai'
+import { generateSpeech, compatibleVoice, voicesForModel } from '@/services/ai'
 import GlassCard from '@/components/common/GlassCard.vue'
 import GradientButton from '@/components/common/GradientButton.vue'
 import Tag from '@/components/common/Tag.vue'
@@ -16,6 +16,7 @@ const router = useRouter()
 const project = useProjectStore()
 const toast = useToastStore()
 const assets = useAssetsStore()
+const settings = useSettingsStore()
 
 const srtText = ref('')
 const audioUrls = ref<Record<string, string>>({})
@@ -63,13 +64,9 @@ const highlightScale = computed({
     nextTick(() => drawPreview())
   }
 })
+const ttsVoices = computed(() => voicesForModel(settings.config.tts.model))
 const ttsVoice = computed({
-  get: () => {
-    const v = project.current?.settings.ttsVoice || 'longanhuan_v3.6'
-    // 旧版 qwen3-tts 音色名（Cherry 等）与新模型不兼容，自动落到默认音色
-    if (TTS_VOICES.some((x) => x.id === v)) return v
-    return 'longanhuan_v3.6'
-  },
+  get: () => compatibleVoice(settings.config.tts.model, project.current?.settings.ttsVoice || settings.config.tts.voice),
   set: (v: string) => project.setSettings({ ttsVoice: v })
 })
 
@@ -384,7 +381,7 @@ function next() {
           <label class="voice-pick">
             <span>音色</span>
             <select v-model="ttsVoice" class="input" style="width: auto; min-width: 160px;">
-              <option v-for="v in TTS_VOICES" :key="v.id" :value="v.id">{{ v.label }}</option>
+              <option v-for="v in ttsVoices" :key="v.id" :value="v.id">{{ v.label }}</option>
             </select>
           </label>
         </template>

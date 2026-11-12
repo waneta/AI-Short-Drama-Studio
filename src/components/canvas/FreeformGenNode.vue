@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Handle, Position, useVueFlow } from '@vue-flow/core'
 import { useAssetsStore, useLibraryStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
 import { runCanvasNode, optimizeFreeformVideoPrompt } from '@/services/canvas/runner'
 import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
-import { isNodeRunning } from '@/services/canvas/jobs'
+import { isNodeRunning, nodeJobStartedAt } from '@/services/canvas/jobs'
 import { friendlyAiError, shouldToastAiError } from '@/services/ai/abort'
+import { displayVideoReferenceTokens } from '@/services/ai/videoReferenceTokens'
+import { imageReferenceMentionAt, insertImageReferenceMention } from '@/services/ai/imageReferenceMentions'
+import { comfyImageModelOption } from '@/services/ai/comfyImageWorkflow'
+import { comfyImageReferenceIssue } from '@/services/ai/comfyImageReference'
 import { cssAspectRatio } from '@/services/canvas/layout'
 import { openLightbox } from '@/composables/useLightbox'
 import NodeBusyOverlay from '@/components/canvas/NodeBusyOverlay.vue'
@@ -15,8 +19,11 @@ import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import CanvasToolbarIcon from '@/components/canvas/CanvasToolbarIcon.vue'
-import AspectRatioSeg from '@/components/common/AspectRatioSeg.vue'
-import VideoResolutionSeg from '@/components/common/VideoResolutionSeg.vue'
+import GenerationDetails from '@/components/common/GenerationDetails.vue'
+import VideoReferenceEditor from '@/components/canvas/VideoReferenceEditor.vue'
+import AudioReferenceControl from '@/components/canvas/AudioReferenceControl.vue'
+import NativeH3VideoControls from '@/components/common/NativeH3VideoControls.vue'
+import { referenceAudioIds, videoReferenceBindings } from '@/services/canvas/videoReferences'
 import { selectCanvasNode } from '@/services/canvas/canvasBridge'
 import { pickLocalFiles } from '@/utils/pickLocalFiles'
 import {
@@ -89,7 +96,7 @@ const prompt = computed({
 })
 const aspectRatio = computed({
   get: () => node.value?.data.aspectRatio ?? project.current?.settings.aspectRatio ?? '16:9',
-  set: (v: AspectRatio) => project.patchCanvasNode(props.id, { aspectRatio: v, outputAssetId: undefined, videoTaskId: undefined })
+  set: (v: AspectRatio) => project.patchCanvasNode(props.id, { aspectRatio: v, videoTaskId: undefined })
 })
 const h3GenMode = computed({
   get: () => normalizeH3GenMode(node.value?.data.h3GenMode),
@@ -203,6 +210,62 @@ const pageImageIds = computed(() => {
 })
 
 const refUrls = ref<Record<string, string>>({})
+const promptInput = ref<HTMLTextAreaElement>()
+const mention = ref<{ start: number; end: number; query: string }>()
+const mentionIndex = ref(0)
+const mentionOptions = computed(() => mention.value ? refs.value.map((id, index) => ({ id, number: index + 1 }))
+  .filter(item => String(item.number).startsWith(mention.value!.query)) : [])
+const effectiveImageProfile = computed(() => node.value?.data.imageProfileId ? settings.config.images.find(p => p.id === node.value?.data.imageProfileId) : settings.config.image)
+const selectedImageLabel = computed(() => comfyImageModelOption(effectiveImageProfile.value, node.value?.data.imageModel || effectiveImageProfile.value?.model || '当前接入'))
+
+const imageReferenceIssue = computed(() => isVideo.value ? undefined : comfyImageReferenceIssue(effectiveImageProfile.value, refs.value.length))
+const referenceModel = computed(() => {
+  if (!imageReferenceIssue.value) return undefined
+  const compatible = settings.config.images.filter(profile => profile.adapter?.type === 'comfyui-prompt' &&
+    !comfyImageReferenceIssue(profile, refs.value.length))
+  return compatible.find(profile => comfyImageModelOption(profile, profile.model).startsWith('Qwen-Image 2.1')) || compatible[0]
+})
+const referenceModelLabel = computed(() => referenceModel.value ? comfyImageModelOption(referenceModel.value, referenceModel.value.model).split(' · ')[0] : '')
+function switchReferenceModel() {
+  const profile = referenceModel.value
+  if (!profile || generating.value) return
+  project.patchCanvasNode(props.id, { imageProfileId: profile.id, imageModel: profile.model })
+}
+
+
+function updateMention() {
+  if (isH3Fl2va.value || !refs.value.length || !promptInput.value) { mention.value = undefined; return }
+  const next = imageReferenceMentionAt(prompt.value, promptInput.value.selectionStart)
+  if (next?.start !== mention.value?.start || next?.query !== mention.value?.query) mentionIndex.value = 0
+  mention.value = next
+}
+
+async function insertReference(number: number) {
+  const input = promptInput.value
+  const result = insertImageReferenceMention(prompt.value,
+    mention.value?.start ?? input?.selectionStart ?? prompt.value.length,
+    mention.value?.end ?? input?.selectionEnd ?? prompt.value.length, number)
+  prompt.value = result.prompt
+  mention.value = undefined
+  await nextTick()
+  input?.focus()
+  input?.setSelectionRange(result.caret, result.caret)
+}
+
+function onPromptKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return
+  if (event.key === 'Escape') { mention.value = undefined; return }
+  const options = mentionOptions.value
+  if (!options.length) return
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault()
+    mentionIndex.value = (mentionIndex.value + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    void insertReference(options[mentionIndex.value]?.number || options[0].number)
+  }
+}
+
 
 async function loadMedia() {
   const id = outputId.value
@@ -389,6 +452,11 @@ function previewFull() {
 
 async function generate() {
   if (generating.value) return
+  if (imageReferenceIssue.value) {
+    panelOpen.value = true
+    toast.warn(`当前模型无法使用这${refs.value.length}张参考图，请先切换到支持参考编辑的模型。`)
+    return
+  }
   if (!prompt.value.trim()) {
     toast.warn('请先写提示词')
     return
@@ -403,7 +471,7 @@ async function generate() {
         toast.warn('请先选尾帧')
         return
       }
-    } else if (!refs.value.length) {
+    } else if (!refs.value.length && !referenceAudioIds(node.value?.data).length) {
       toast.warn('请先选至少一张参考图')
       return
     }
@@ -466,7 +534,7 @@ async function downloadAsset() {
 }
 
 function copyPrompt() {
-  const t = prompt.value.trim()
+  const t = isVideo.value ? displayVideoReferenceTokens(prompt.value.trim(), videoReferenceBindings(refs.value, referenceAudioIds(node.value?.data), node.value?.data.videoReferenceOrder)) : prompt.value.trim()
   if (!t) {
     toast.warn('没有提示词')
     return
@@ -540,23 +608,6 @@ function removeSelf() {
           <button type="button" @click="duplicateSelf">
             <span>❐</span>复制
           </button>
-          <div v-if="isVideo" class="dur-edit">
-            <button type="button" class="dur-btn" @click="durOpen = durOpen === 'bar' ? '' : 'bar'">
-              {{ duration }} 秒
-            </button>
-            <div v-if="durOpen === 'bar'" class="dur-menu">
-              <button
-                v-for="n in durationOptions"
-                :key="'bar-' + n"
-                type="button"
-                :class="{ on: n === duration }"
-                @mousedown.prevent.stop
-                @click.stop="pickDuration(n)"
-              >
-                {{ n }} 秒
-              </button>
-            </div>
-          </div>
           <button v-if="hasAsset" type="button" @click="downloadAsset">
             <span>⬇</span>下载
           </button>
@@ -606,7 +657,7 @@ function removeSelf() {
         {{ isVideo ? '▶' : '＋' }}
       </div>
       <span v-if="isVideo && duration" class="dur-tag">{{ duration }}s</span>
-      <NodeBusyOverlay v-if="generating" :label="busyLabel || (isVideo ? '出视频…' : '出图…')" />
+      <NodeBusyOverlay v-if="generating" :label="busyLabel || (isVideo ? '出视频…' : '出图…')" :started-at="nodeJobStartedAt(props.id)" />
       <div v-if="failMsg && !generating" class="fail" :title="failMsg">{{ failMsg }}</div>
     </div>
 
@@ -629,11 +680,13 @@ function removeSelf() {
           v-model:first-id="firstFrameId"
           v-model:last-id="lastFrameId"
         />
-        <div v-else class="refs">
-          <div v-for="id in refs" :key="id" class="thumb nodrag nopan nowheel">
+        <div v-else-if="!isVideo" class="refs">
+          <div v-for="(id, index) in refs" :key="id" class="thumb nodrag nopan nowheel">
             <button type="button" class="thumb-preview nodrag" title="查看大图" @pointerdown.stop @click.stop="previewRef(id)">
               <img v-if="refUrls[id]" :src="refUrls[id]" alt="" />
             </button>
+            <button type="button" class="thumb-ref-number" :title="`在提示词插入 @${index + 1}`"
+              @pointerdown.prevent.stop @click.stop="insertReference(index + 1)">@{{ index + 1 }}</button>
             <button
               type="button"
               class="thumb-del nodrag nopan nowheel"
@@ -646,6 +699,7 @@ function removeSelf() {
           <button type="button" class="add nodrag" title="上传参考图" @click="uploadRefs">＋</button>
           <button type="button" class="add nodrag" title="从本页或资产库选择参考图" @click="openRefPicker">库</button>
         </div>
+        <AudioReferenceControl v-if="isVideo && isH3Fl2va" :node-id="props.id" />
         <div v-if="isH3Video" class="prompt-tools">
           <button
             type="button"
@@ -656,54 +710,56 @@ function removeSelf() {
             {{ optimizingPrompt ? '优化中…' : '优化提示词' }}
           </button>
         </div>
-        <textarea
+        <div v-if="refs.length && !isH3Fl2va && !isVideo" class="ref-hint">按缩略图顺序使用 @1、@2。当前：{{ isVideo ? effectiveVideoProfile?.name || '视频接入' : selectedImageLabel }}</div>
+        <div v-if="imageReferenceIssue" class="ref-model-warning" role="alert">
+          <span>已连接{{ refs.length }}张参考图，当前模型无法执行本次参考图编辑。</span>
+          <button v-if="referenceModel" type="button" class="switch-ref-model" :disabled="generating"
+            @click.stop="switchReferenceModel">切换到 {{ referenceModelLabel }}</button>
+          <span v-else>请在「出图」中选择支持这些参考图的模型，或在设置中添加接入。</span>
+        </div>
+        <VideoReferenceEditor v-if="isVideo && !isH3Fl2va" :node-id="props.id" v-model="prompt" :disabled="generating || optimizingPrompt" />
+        <textarea v-else
+          ref="promptInput"
           v-model="prompt"
+          @input="updateMention"
+          @click="updateMention"
+          @keyup="event => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention() }"
+          @keydown="onPromptKeydown"
+          @blur="mention = undefined"
           rows="6"
           :placeholder="
             isVideo
-              ? videoModel === 'wan-prime'
-                ? '写视频提示词。多张参考图时可用图1、图2指代人物/场景…'
-                : '写视频提示词，描述动作、镜头和声音。点「优化提示词」会编成 H3 格式。'
-              : '写提示词，可加参考图做图生图…'
+              ? isH3Fl2va
+                ? '写首尾帧视频提示词，描述两帧之间的动作、镜头和声音…'
+                : '写视频提示词，输入 @ 选择参考图，例如 @1 的人物手持 @2 的武器，描述动作和镜头…'
+              : '写提示词，输入 @ 选择参考图，例如 @1 的人物手持 @2 的武器…'
           "
         />
+        <div v-if="!isVideo && !isH3Fl2va && mention && mentionOptions.length" class="ref-mention-menu" role="listbox" aria-label="选择参考图">
+          <button v-for="(item, index) in mentionOptions" :key="item.id" type="button" role="option"
+            :aria-selected="index === mentionIndex" :class="{ active: index === mentionIndex }"
+            @pointerdown.prevent.stop @click.stop="insertReference(item.number)">
+            <img v-if="refUrls[item.id]" :src="refUrls[item.id]" alt="" />
+            <span>@{{ item.number }} 参考图 {{ item.number }}</span>
+          </button>
+        </div>
         <div class="prompt-foot">
-          <ImageModelSelect v-if="!isVideo" />
+          <ImageModelSelect v-if="!isVideo" :reference-count="refs.length" :node-id="props.id" />
           <VideoModelSelect
+          :node-id="props.id"
             v-else
             v-model="videoModel"
             :profile-id="node?.data.videoProfileId"
             @select-profile="(id) => applyShotVideoProfile(props.id, id)"
           />
           <!-- 比例和模型同排：一眼看到「用什么模型、出什么画幅」 -->
-          <AspectRatioSeg v-model="aspectRatio" compact />
-          <VideoResolutionSeg
-            v-if="isVideo && videoAllows1080p(videoModel) && !isH3Fl2va"
-            v-model="videoResolution"
-            compact
-          />
-          <div v-if="isVideo" class="dur-edit">
-            <button type="button" class="dur-btn" @click="durOpen = durOpen === 'foot' ? '' : 'foot'">
-              {{ duration }} 秒
-            </button>
-            <div v-if="durOpen === 'foot'" class="dur-menu">
-              <button
-                v-for="n in durationOptions"
-                :key="'foot-' + n"
-                type="button"
-                :class="{ on: n === duration }"
-                @mousedown.prevent.stop
-                @click.stop="pickDuration(n)"
-              >
-                {{ n }} 秒
-              </button>
-            </div>
-          </div>
-          <button class="go" type="button" :disabled="generating || optimizingPrompt" :title="genLabel" @click="generate">↑</button>
+          <NativeH3VideoControls v-if="isVideo" :node-id="props.id" />
+          <button class="go" type="button" :disabled="generating || optimizingPrompt || Boolean(imageReferenceIssue)" :title="imageReferenceIssue ? '请先切换到支持参考图的模型' : genLabel" @click="generate">↑</button>
         </div>
       </div>
     </transition>
 
+    <GenerationDetails :asset-id="outputId" />
     <Handle id="out" type="source" :position="Position.Right" class="hndl" />
 
     <AssetPicker
@@ -994,6 +1050,24 @@ function removeSelf() {
   display: block;
   pointer-events: none;
 }
+.thumb-ref-number {
+  position: absolute; left: 0; bottom: 0; z-index: 4; padding: 1px 4px; border: none;
+  border-radius: 4px; background: #191919d9; color: white; font-size: 11px; cursor: pointer;
+}
+.ref-model-warning { margin: 4px 0 8px; padding: 8px; border: 1px solid var(--color-border); border-radius: 8px; color: var(--color-text-1); font-size: 11px; line-height: 1.5; display: grid; gap: 6px; }
+.switch-ref-model { padding: 6px 8px; border: 1px solid var(--color-accent); border-radius: 6px; background: var(--color-bg-2); color: var(--color-accent); cursor: pointer; font: inherit; }
+.switch-ref-model:disabled { opacity: .5; cursor: default; }
+.ref-hint { margin: 2px 0 6px; color: var(--color-text-3); font-size: 11px; line-height: 1.5; }
+.ref-mention-menu {
+  max-height: 180px; overflow-y: auto; padding: 4px; margin-bottom: 6px;
+  border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-bg-2);
+}
+.ref-mention-menu button {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px; border: none;
+  background: transparent; color: var(--color-text-1); text-align: left; cursor: pointer;
+}
+.ref-mention-menu button.active, .ref-mention-menu button:hover { background: var(--color-fill-hover); }
+.ref-mention-menu img { width: 28px; height: 28px; border-radius: 4px; object-fit: cover; }
 .thumb-del {
   position: absolute;
   top: -6px;

@@ -1,0 +1,30 @@
+[
+  {
+    "slug": "01-key",
+    "title": "忘带钥匙",
+    "shots": 3,
+    "duration": 15,
+    "chapter": "05-key.md"
+  },
+  {
+    "slug": "02-umbrella",
+    "title": "雨中的伞",
+    "shots": 5,
+    "duration": 25,
+    "chapter": "06-umbrella.md"
+  },
+  {
+    "slug": "03-appointment",
+    "title": "迟到的约定",
+    "shots": 8,
+    "duration": 40,
+    "chapter": "07-appointment.md"
+  },
+  {
+    "slug": "04-visitor",
+    "title": "门后的来客",
+    "shots": 12,
+    "duration": 60,
+    "chapter": "08-visitor.md"
+  }
+]

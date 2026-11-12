@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router'
+import { isDesktop } from '@/services/desktop'
 import { useProjectStore, useAssetsStore, useSettingsStore, endpointReady } from '@/stores'
 
 const routes: RouteRecordRaw[] = [
@@ -103,7 +104,8 @@ router.beforeEach(async (to) => {
 
   const llmReady = endpointReady(settings.config.llm)
   const section = String(to.params.section || '')
-  if (!llmReady && to.name !== 'settings') {
+  // Web users can edit local media and use ComfyUI without a paid LLM endpoint.
+  if (isDesktop() && !llmReady && to.name !== 'settings') {
     return '/settings/llm'
   }
   if (to.name === 'settings' && !section) {

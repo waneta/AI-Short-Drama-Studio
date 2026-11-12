@@ -12,6 +12,12 @@ declare module '*.md?raw' {
 }
 
 interface ImportMetaEnv {
+  readonly VITE_STARTUP_VIDEO_PROFILE: string
+  readonly VITE_STARTUP_IMAGE_PROFILE: string
+  readonly VITE_COMFY_PROXY_TARGET: string
+  readonly VITE_COMFY_IMAGE_PROXY_TARGET: string
+  readonly VITE_COMFY_REMOTE_IMAGE_PROXY_TARGET: string
+  readonly VITE_TOKEN_PLAN_WEB_PROXY: string
   readonly VITE_AI_REAL_MODE: string
   readonly VITE_LLM_BASE_URL: string
   readonly VITE_LLM_API_KEY: string

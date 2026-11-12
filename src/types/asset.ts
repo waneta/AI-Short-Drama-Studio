@@ -12,7 +12,49 @@ import type { ID } from './project'
 
 export type AssetKind = 'image' | 'video' | 'audio'
 
+export interface GenerationRecord {
+  version: 1
+  kind: 'image' | 'video'
+  createdAt: number
+  /** Client elapsed time from submission to downloaded result, including uploads and queueing. */
+  elapsedMs?: number
+  profileId?: string
+  profileName?: string
+  model: string
+  provider?: string
+  adapter?: string
+  prompt: string
+  userPrompt?: string
+  requestedWidth?: number
+  requestedHeight?: number
+  generationWidth?: number
+  generationHeight?: number
+  aspectRatio?: string
+  resolution?: string
+  style?: string
+  seed?: number
+  steps?: number
+  cfg?: number
+  sampler?: string
+  scheduler?: string
+  denoise?: number
+  samplers?: Array<Record<string, string | number | boolean>>
+  checkpoints?: string[]
+  promptId?: string
+  fps?: number
+  duration?: number
+  mode?: string
+  audioEnabled?: boolean
+  referenceCount?: number
+  referenceAudio?: { assetId?: string; filename?: string }
+  referenceAudios?: Array<{ assetId?: string; filename?: string }>
+  /** A preexisting resumed task may not have recorded its original request. */
+  parametersUnknown?: boolean
+}
+
 export interface AssetBase {
+  /** Immutable submission facts belonging to this result, independent of node draft settings. */
+  generation?: GenerationRecord
   id: ID
   kind: AssetKind
   mimeType: string

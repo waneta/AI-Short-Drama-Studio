@@ -40,20 +40,23 @@ export function getVisionConfig() {
   return {
     baseUrl: (s?.baseUrl || d.baseUrl).replace(/\/+$/, ''),
     apiKey: s?.apiKey || d.apiKey,
-    // 旧视觉配置自动迁移到项目指定的 Qwen3-VL。
-    model: /^(qwen3\.7|qwen-vl-)/i.test(selectedModel) ? 'qwen3-vl-plus' : selectedModel,
+    model: selectedModel,
     adapter: s?.adapter,
     provider: s?.provider
   }
 }
 
-export function getImageConfig() {
+export function getImageConfig(profileId?: string) {
   const d = envDefaults().image
-  const s = pick()?.image
+  const settings = pick()
+  const s = profileId ? settings?.images?.find(profile => profile.id === profileId) : settings?.image
+  if (profileId && !s) throw new Error('图片节点选择的模型接入已删除，请在该节点重新选择模型。')
   return {
     baseUrl: (s?.baseUrl || d.baseUrl).replace(/\/+$/, ''),
     apiKey: s?.apiKey || d.apiKey,
     model: s?.model || d.model,
+    id: profileId || settings?.activeImageId,
+    name: settings?.images?.find(profile => profile.id === (profileId || settings?.activeImageId))?.name,
     adapter: s?.adapter,
     provider: s?.provider
   }
@@ -111,8 +114,9 @@ export function getVideoConfig(profileId?: string) {
   const d = envDefaults().video
   const settings = pick()
   let s = profileId
-    ? settings?.videos?.find((profile) => profile.id === profileId) || settings?.video
+    ? settings?.videos?.find((profile) => profile.id === profileId)
     : settings?.video
+  if (profileId && !s) throw new Error('视频节点选择的接入已删除，请在该节点重新选择模型。')
   if (s) s = normalizeStoredVideoEndpoint(s)
   // 只有这条接入本身就是 Zealman，且工作流 id 也是内置 U 系列时，才允许把误填的 autodl.art 换回镜像地址。
   // 不能因为残留 adapter 就把用户选中的 AutoDL 整份换成 SeetaCloud。
@@ -139,7 +143,9 @@ export function getVideoConfig(profileId?: string) {
     baseUrl: migrateVideoBaseUrl(s?.baseUrl || d.baseUrl),
     apiKey: videoKeyForProfile(s, d.apiKey),
     workflowId: migrateVideoWorkflowId(s?.workflowId || d.workflowId),
-    promptStyle: getVideoPromptStyle(),
+    id: profileId || settings?.activeVideoId,
+    name: settings?.videos?.find(profile => profile.id === (profileId || settings?.activeVideoId))?.name,
+    promptStyle: s?.promptStyle === 'formatted' ? 'formatted' as const : 'scene-narrative' as const,
     adapter: s?.adapter,
     provider: s?.provider,
     zealmanBaseUrl: settings?.zealmanBaseUrl || ''

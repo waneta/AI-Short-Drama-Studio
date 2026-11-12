@@ -43,6 +43,9 @@ export interface ComfyInputBinding {
   field: string
   /** 图片/音频类：upload=先上传到 Comfy 再写文件名（默认）｜path=直接写本地路径｜url=直接写 URL */
   mediaMode?: 'upload' | 'path' | 'url'
+  /** Zero-based reference image index; omitted means the first image (legacy maps). */
+  imageIndex?: number
+  audioIndex?: number
   /** 助手给的备注 */
   note?: string
 }
@@ -142,6 +145,7 @@ const ANALYZE_SYSTEM = `你是 ComfyUI 工作流分析器。给你一个 API For
 5. 被选中的字段必须是字符串或数值，不能是连线引用（形如 ←#6 的那种输入）。
 6. 找不到某个角色就省略，绝不编造节点或字段。
 7. 同一角色若有多个候选（如多个文本编码节点），选真正参与出图的那一个。
+8. 多张参考图使用多个role=image绑定，增加imageIndex（从0开始，@1对应0、@2对应1）。沿实际图像输入顺序判断，不按节点ID排序；同一张图被多个节点复用时保持相同imageIndex。
 
 只输出 JSON，不要解释：
 {"kind":"text-to-image|image-to-image|text-to-video|image-to-video|audio-sync|unknown","summary":"一句话说明这个工作流做什么","bindings":[{"role":"prompt","nodeId":"6","field":"text","mediaMode":"upload","note":"说明"}],"notes":"给使用者的提示，比如需要哪个模型、要准备几张图"}`
@@ -153,11 +157,17 @@ function toBinding(raw: any): ComfyInputBinding | null {
   const field = String(raw?.field ?? raw?.input ?? '').trim()
   if (!nodeId || !field) return null
   const mode = String(raw?.mediaMode || raw?.imageMode || '').trim()
+  const audioIndex = raw?.audioIndex
+  if (role === 'audio' && audioIndex !== undefined && (!Number.isInteger(audioIndex) || audioIndex < 0 || audioIndex > 2)) return null
+  const imageIndex = raw?.imageIndex
+  if (role === 'image' && imageIndex !== undefined && (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex > 15)) return null
   return {
     role,
     nodeId,
     field,
     ...(mode === 'upload' || mode === 'path' || mode === 'url' ? { mediaMode: mode } : {}),
+    ...(role === 'image' && imageIndex !== undefined ? { imageIndex } : {}),
+    ...(role === 'audio' && audioIndex !== undefined ? { audioIndex } : {}),
     ...(raw?.note ? { note: String(raw.note).slice(0, 120) } : {})
   }
 }
@@ -349,7 +359,7 @@ export function describeInputMap(map: ComfyInputMap): string {
   if (!map?.bindings?.length) return '没有可注入的输入'
   return map.bindings
     .map((b) => {
-      const base = `${COMFY_ROLE_LABEL[b.role]} → #${b.nodeId}.${b.field}`
+      const base = `${b.role === 'image' ? `@${(b.imageIndex ?? 0) + 1} ` : ''}${COMFY_ROLE_LABEL[b.role]} → #${b.nodeId}.${b.field}`
       return b.note ? `${base}（${b.note}）` : base
     })
     .join('；')
@@ -372,9 +382,13 @@ export interface ComfyInjectValues {
   prompt?: string
   negative?: string
   image?: string
+  images?: string[]
+  uploadedImages?: string[]
   imageEnd?: string
   mask?: string
   audio?: string
+  audios?: string[]
+  uploadedAudios?: string[]
   seed?: number
   width?: number
   height?: number
@@ -415,14 +429,15 @@ export function applyComfyInputs(
       skipped.push(`${COMFY_ROLE_LABEL[b.role]}：节点 #${b.nodeId} 不存在`)
       continue
     }
-    const raw = (values as any)[b.role]
+    const index = (b.role === 'audio' ? b.audioIndex : b.imageIndex) ?? 0
+    const raw = b.role === 'image' && values.images ? values.images[index] : b.role === 'audio' && values.audios ? values.audios[index] : (values as any)[b.role]
     if (raw === undefined || raw === null || raw === '') {
       skipped.push(`${COMFY_ROLE_LABEL[b.role]}：本次没提供该输入`)
       continue
     }
     if (isMediaRole(b.role)) {
       const mode = b.mediaMode || 'upload'
-      const uploaded = values.uploaded?.[b.role]
+      const uploaded = b.role === 'image' && values.uploadedImages ? values.uploadedImages[index] : b.role === 'audio' && values.uploadedAudios ? values.uploadedAudios[index] : values.uploaded?.[b.role]
       const value = mode === 'upload' && uploaded ? uploaded : String(raw)
       ;(node.inputs as Record<string, any>)[b.field] = value
       writes.push(`${COMFY_ROLE_LABEL[b.role]} → #${b.nodeId}.${b.field}`)

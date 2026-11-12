@@ -1,0 +1,95 @@
+{
+  "version": "0.1.0",
+  "projects": [
+    {
+      "id": "juliu-window-trip-tutorial",
+      "name": "窗边的小旅行 · 教材项目",
+      "script": {
+        "id": "tutorial-script",
+        "topic": "窗边的小旅行",
+        "content": "# 窗边的小旅行\n\n清晨，阳光落在木质书桌上，一辆红色玩具车静静停着。\n镜头靠近黑色车轮，细小的木纹像一条等待出发的路。\n玩具车朝着窗边明亮的方向，开始一段小小的旅行。\n\n时长：15 秒。横屏。一辆玩具车，一个书桌场景，无人物、无对白。\n字幕：清晨，旅程开始。 / 世界就在眼前。 / 向着光，出发。\n",
+        "keywords": [
+          "玩具车",
+          "窗边",
+          "出发"
+        ],
+        "style": "cinematic",
+        "aspectRatio": "16:9",
+        "shotDuration": 5,
+        "createdAt": 1792540800000
+      },
+      "shots": [
+        {
+          "id": "tutorial-shot-1",
+          "index": 0,
+          "title": "清晨出发",
+          "visualPrompt": "窗边木质书桌上的红色玩具车，三分之四侧面，清晨柔光，温暖写实，无文字",
+          "audioDescription": "安静室内环境声",
+          "voiceover": "清晨，旅程开始。",
+          "audioMode": "none",
+          "duration": 5,
+          "cameraMovement": "static",
+          "status": "draft",
+          "notes": "先做图片预演，再选修视频生成"
+        },
+        {
+          "id": "tutorial-shot-2",
+          "index": 1,
+          "title": "车轮特写",
+          "visualPrompt": "红色玩具车的黑色车轮与桌面木纹特写，左侧柔光，浅景深，温暖写实，无文字",
+          "audioDescription": "安静室内环境声",
+          "voiceover": "世界就在眼前。",
+          "audioMode": "none",
+          "duration": 5,
+          "cameraMovement": "static",
+          "status": "draft",
+          "notes": "先做图片预演，再选修视频生成"
+        },
+        {
+          "id": "tutorial-shot-3",
+          "index": 2,
+          "title": "朝向阳光",
+          "visualPrompt": "红色玩具车停在窗边木质书桌明亮区域，背景简洁，暖色自然光，温暖写实，无文字",
+          "audioDescription": "安静室内环境声",
+          "voiceover": "向着光，出发。",
+          "audioMode": "none",
+          "duration": 5,
+          "cameraMovement": "push",
+          "status": "draft",
+          "notes": "先做图片预演，再选修视频生成"
+        }
+      ],
+      "subjects": [],
+      "scenes": [],
+      "timeline": [],
+      "settings": {
+        "aspectRatio": "16:9",
+        "width": 1280,
+        "height": 720,
+        "fps": 24,
+        "defaultShotDuration": 5,
+        "captionStyle": {
+          "fontFamily": "Noto Sans CJK SC",
+          "fontSizeRatio": 0.03,
+          "color": "#ffffff",
+          "strokeColor": "#000000",
+          "strokeWidth": 3,
+          "bgColor": "#000000",
+          "bgOpacity": 0.4,
+          "position": "bottom",
+          "bold": true
+        },
+        "defaultTransition": "none",
+        "bgmVolume": 0.22,
+        "originalVolume": 0.55,
+        "keepAmbientAudio": true,
+        "burnCaptions": true,
+        "ttsVoice": ""
+      },
+      "playApproved": true,
+      "pipelineMode": "standard",
+      "createdAt": 1792540800000,
+      "updatedAt": 1792540800000
+    }
+  ]
+}

@@ -39,7 +39,8 @@ const tab = ref<'page' | 'library'>('page')
 const libraryFolder = ref(LIBRARY_PUBLIC_ID)
 
 const kind = computed(() => props.kind ?? 'image')
-const showTabs = computed(() => Boolean(props.showLibrary) && kind.value !== 'video' && kind.value !== 'audio')
+const showTabs = computed(() => Boolean(props.showLibrary) && kind.value !== 'video')
+const hasPageScope = computed(() => props.pageIds !== undefined)
 
 const list = computed(() => {
   if (tab.value === 'library' && showTabs.value) {
@@ -51,7 +52,7 @@ const list = computed(() => {
     kind.value === 'all'
       ? assets.all
       : assets.all.filter((a) => a.kind === kind.value)
-  if (props.pageIds?.length) {
+  if (hasPageScope.value) {
     const allow = new Set(props.pageIds)
     const fromProject = items.filter((a) => allow.has(a.id))
     const have = new Set(fromProject.map((a) => a.id))
@@ -65,15 +66,17 @@ const list = computed(() => {
       : []
     return [...fromProject, ...fromLib]
   }
-  return items
+  const projectId = project.current?.id
+  return projectId ? items.filter((a) => a.projectId === projectId) : []
 })
 
-const pageTabLabel = computed(() => (props.pageIds?.length ? '本页图片' : '项目图片'))
+const mediaLabel = computed(() => kind.value === 'audio' ? '声音' : kind.value === 'video' ? '视频' : kind.value === 'all' ? '素材' : '图片')
+const pageTabLabel = computed(() => `${hasPageScope.value ? '本页' : '项目'}${mediaLabel.value}`)
 const pickerHint = computed(() => {
   if (!showTabs.value) return '已生成/上传的素材都在这里'
-  return props.pageIds?.length
-    ? '可从本页图片、公共资产或自己的分类文件夹选用'
-    : '可从本项目图片、公共资产或自己的分类文件夹选用'
+  return hasPageScope.value
+    ? `可从本页${mediaLabel.value}、公共资产或自己的分类文件夹选用`
+    : `可从本项目${mediaLabel.value}、公共资产或自己的分类文件夹选用`
 })
 
 const emptyTitle = computed(() => {
@@ -81,8 +84,9 @@ const emptyTitle = computed(() => {
     if (libraryFolder.value === LIBRARY_PUBLIC_ID) return '公共资产还是空的'
     return `「${library.folderName(libraryFolder.value)}」还是空的`
   }
+  if (kind.value === 'audio') return '项目里还没有声音'
   if (kind.value === 'video') return '项目里还没有视频'
-  return props.pageIds?.length ? '本页还没有图片' : '项目里还没有图片'
+  return hasPageScope.value ? '本页还没有图片' : '项目里还没有图片'
 })
 
 const emptyDesc = computed(() => {
@@ -92,8 +96,9 @@ const emptyDesc = computed(() => {
     }
     return '去首页资产库创建分类，再把公共资产转移进来'
   }
+  if (kind.value === 'audio') return '上传参考声音，或切到资产库选用已保存的声音'
   if (kind.value === 'video') return '先在画布上出视频，或去资产库上传'
-  return props.pageIds?.length
+  return hasPageScope.value
     ? '先用图片节点出图，或点节点上的＋上传参考图'
     : '先生成或上传图片，也可切到资产库选用可复用的图'
 })
@@ -104,7 +109,7 @@ watch(
     if (!open) return
     picked.value = new Set(props.selectedIds ?? [])
     tab.value =
-      props.defaultTab ?? (props.pageIds?.length || !showTabs.value ? 'page' : 'library')
+      props.defaultTab ?? (hasPageScope.value || !showTabs.value ? 'page' : 'library')
     libraryFolder.value = LIBRARY_PUBLIC_ID
     loading.value = true
     try {
@@ -117,7 +122,7 @@ watch(
   }
 )
 
-watch([tab, libraryFolder], () => {
+watch([tab, libraryFolder, () => project.current?.id, () => props.pageIds], () => {
   if (props.open) loadUrls()
 })
 
@@ -214,19 +219,25 @@ function labelOf(a: Asset) {
             :description="emptyDesc"
           />
           <div v-else class="grid">
-            <button
+            <div
               v-for="a in list"
               :key="a.id"
               class="card"
               :class="{ selected: picked.has(a.id) }"
+              role="button" tabindex="0" :aria-pressed="picked.has(a.id)"
               @click="toggle(a.id)"
+              @keydown.enter.self.prevent="toggle(a.id)" @keydown.space.self.prevent="toggle(a.id)"
             >
               <div class="thumb">
-                <img v-if="urls[a.id] && a.kind === 'image'" :src="urls[a.id]" alt="" />
+                <div v-if="a.kind === 'audio'" class="audio-preview" @click.stop @keydown.stop>
+                  <span>♫ {{ a.duration.toFixed(1) }} 秒</span>
+                  <audio v-if="urls[a.id]" :src="urls[a.id]" controls preload="metadata" :aria-label="`试听 ${a.filename}`" />
+                </div>
+                <img v-else-if="urls[a.id] && a.kind === 'image'" :src="urls[a.id]" alt="" />
                 <img v-else-if="urls[a.id] && a.kind === 'video'" :src="urls[a.id]" alt="" />
                 <div v-else class="ph">{{ a.kind === 'video' ? '🎥' : '🖼' }}</div>
                 <button
-                  v-if="urls[a.id]"
+                  v-if="urls[a.id] && a.kind !== 'audio'"
                   class="zoom"
                   type="button"
                   title="查看大图"
@@ -246,7 +257,7 @@ function labelOf(a: Asset) {
                 </div>
               </div>
               <div v-if="picked.has(a.id)" class="check">✓</div>
-            </button>
+            </div>
           </div>
 
           <footer class="foot">
@@ -263,6 +274,8 @@ function labelOf(a: Asset) {
 </template>
 
 <style scoped>
+.audio-preview { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 8px; box-sizing: border-box; }
+.audio-preview audio { width: 100%; min-width: 0; height: 36px; }
 .mask {
   position: fixed;
   inset: 0;
@@ -276,12 +289,20 @@ function labelOf(a: Asset) {
 .modal {
   width: min(960px, 100%);
   max-height: min(86vh, 820px);
+  min-height: 0;
+  overflow: hidden;
   background: var(--color-bg-1);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-lg);
+}
+.head,
+.tabs,
+.folder-rail,
+.foot {
+  flex-shrink: 0;
 }
 .head {
   display: flex;
@@ -366,14 +387,20 @@ function labelOf(a: Asset) {
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(148px, 100%), 1fr));
+  /* Keep each card's natural height; only the list viewport may shrink. */
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 10px;
   padding: 16px 20px;
+  min-height: 0;
   overflow-y: auto;
   flex: 1;
 }
 .card {
   position: relative;
+  min-width: 0;
+  padding: 0;
   text-align: left;
   background: var(--color-bg-2);
   border: 1px solid var(--color-border);
@@ -398,7 +425,7 @@ function labelOf(a: Asset) {
 .thumb video {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
 }
 .zoom {

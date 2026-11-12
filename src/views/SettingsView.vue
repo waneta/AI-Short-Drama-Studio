@@ -10,6 +10,8 @@ import Tag from '@/components/common/Tag.vue'
 import { estimateStorage } from '@/services/storage'
 import { isFFmpegReady, getFFmpeg, resetFFmpeg } from '@/services/ffmpeg'
 import { desktop, isDesktop } from '@/services/desktop'
+import coreJsUrl from '@/assets/ffmpeg/ffmpeg-core.esm.js?url'
+import coreWasmUrl from '@/assets/ffmpeg/ffmpeg-core.wasm?url'
 
 const router = useRouter()
 const route = useRoute()
@@ -140,8 +142,12 @@ async function runDiagnostics() {
   diag.value.crossOriginIsolated = self.crossOriginIsolated
   diag.value.sharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined'
   try {
-    const r = await fetch('/ffmpeg/ffmpeg-core.js', { method: 'HEAD' })
-    diag.value.localCore = r.ok
+    const [js, wasm] = await Promise.all([
+      fetch(coreJsUrl, { method: 'HEAD' }),
+      fetch(coreWasmUrl, { method: 'HEAD' })
+    ])
+    diag.value.localCore = js.ok && wasm.ok &&
+      Boolean(wasm.headers.get('content-type')?.includes('application/wasm'))
   } catch {
     diag.value.localCore = false
   }
@@ -366,6 +372,10 @@ function navReady(id: SettingsSection) {
       </div>
     </header>
 
+    <p v-if="!isDesktop() && !llmReady" class="local-mode-note">
+      本地练习可以暂不配置语言模型：<RouterLink to="/">进入项目</RouterLink>，或在「图像生成」接入 ComfyUI。
+      AI 写剧本和接入助手仍需要语言模型。
+    </p>
     <div class="body">
       <nav class="side" aria-label="设置分区">
         <p class="group">AI 能力</p>
@@ -473,7 +483,7 @@ function navReady(id: SettingsSection) {
           <section class="panel">
             <h2>剪辑引擎</h2>
             <p class="card-desc">
-              素材拼接、转场、烧字幕和成片导出都靠它。首次用到时会自动下载约 30MB 的组件，也可以现在就加载。
+              素材拼接、转场、烧字幕和成片导出都靠它。本分支安装时通过 npm run setup:web 准备约 30MB 的本地核心，也可以现在加载检查。
             </p>
             <div class="engine-row">
               <div>
@@ -564,7 +574,7 @@ function navReady(id: SettingsSection) {
           <section class="panel">
             <h2>备份与清理</h2>
             <p class="card-desc">
-              导出会把所有项目打包成一个文件，拿到别的电脑上导入就能接着用；清空会连素材一起删除，删之前想清楚。
+              导出包含项目结构与设置，可能包含 API Key，但不包含图片、视频、音频文件。请另行下载素材；分享前移除密钥。清空会删除项目及关联素材。
             </p>
             <div class="acts">
               <button type="button" class="mini" @click="exportProjectData">导出所有项目</button>
@@ -594,6 +604,7 @@ function navReady(id: SettingsSection) {
 </template>
 
 <style scoped>
+.local-mode-note { margin: 12px 24px; line-height: 1.7; }
 .settings {
   height: 100%;
   display: flex;

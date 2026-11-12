@@ -94,6 +94,22 @@
 
 建议先配置语言模型，再把公开 API 文档交给接入助手。私人 Key 最好在对应设置页面手动填写，不要粘贴到不可信的第三方对话中。
 
+## Ubuntu / Linux Web 版（本分支）
+
+14 章实操、4 套人物剧情示例（28 镜头），按 DeepSeek + 百炼云端出片、本地 ComfyUI 迁移的顺序学习，见 **[AI 漫剧实操手册](docs/ubuntu-tutorial/README.md)**，也可打开 [网页版](docs/ubuntu-tutorial/index.html)。
+
+```bash
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci
+npm run setup:web
+npm run web
+```
+
+访问 `http://127.0.0.1:5173`。Web 模式不启动 Electron；剪辑核心来自锁定的 npm 依赖。未配置语言模型时仍可创建项目、剪辑本地素材和使用自建 ComfyUI，AI 写作与接入助手仍需相应接口。
+
+本分支内置固定目标的 ComfyUI 同源代理，默认 `http://127.0.0.1:8188`，只用于本机开发/预览。需要其它端口时用 `COMFYUI_URL=http://127.0.0.1:8189 npm run web`，并在设置里填写同一个地址。没有部署通用云端 API 代理。
+
+验证：`npm run test:web`、`npm run build:web`；构建预览：`npm run preview:web`（4173）。Web 项目与媒体保存在当前浏览器，切换地址或端口不会共享存储；请下载原始素材并导出项目 JSON。
+
 ## 从源码运行
 
 ### 环境要求

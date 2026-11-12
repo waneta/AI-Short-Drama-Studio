@@ -1,9 +1,17 @@
+import { comfyGenerationRecord } from './generationRecord'
+import type { GenerationRecord } from '@/types'
 /**
  * 自定义接入适配器：OpenAI 兼容 / 自定义 HTTP / ComfyUI（AutoDL 风格 + 原生 /prompt）
  * 配置写在 settings 的 adapter 字段，运行时按 type 分流。
  */
 
 import { desktop, isDesktop } from '@/services/desktop'
+import { comfyWebProxyUrl } from './comfyWebProxy'
+import { withComfyImageSizeMap } from './comfyImageSize'
+import { withComfyImageReference } from './comfyImageReference'
+import { validateComfyVideoReferences } from './comfyVideoReference'
+import { withFlux3Attention } from './comfyFlux3Reference'
+import { tokenPlanWebProxyUrl } from './tokenPlanWebProxy'
 import {
   applyComfyInputs,
   COMFY_ROLE_LABEL,
@@ -322,7 +330,12 @@ export async function providerHttp(
       body = bytes
       if (init.contentType) headers['Content-Type'] = init.contentType
     }
-    const resp = await fetch(url, {
+    const comfyUrl = comfyWebProxyUrl(
+      url, import.meta.env.VITE_COMFY_PROXY_TARGET, isDesktop(), import.meta.env.VITE_COMFY_IMAGE_PROXY_TARGET,
+      import.meta.env.VITE_COMFY_REMOTE_IMAGE_PROXY_TARGET
+    )
+    const requestUrl = tokenPlanWebProxyUrl(comfyUrl, import.meta.env.VITE_TOKEN_PLAN_WEB_PROXY === 'true')
+    const resp = await fetch(requestUrl, {
       method,
       headers,
       body,
@@ -665,7 +678,12 @@ function extOfMime(mime: string): string {
   if (/jpe?g/i.test(mime)) return 'jpg'
   if (/webp/i.test(mime)) return 'webp'
   if (/gif/i.test(mime)) return 'gif'
-  if (/mp4|webm/i.test(mime)) return 'mp4'
+  if (/audio\/mp4/i.test(mime)) return 'm4a'
+  if (/webm/i.test(mime)) return 'webm'
+  if (/ogg/i.test(mime)) return 'ogg'
+  if (/flac/i.test(mime)) return 'flac'
+  if (/aac/i.test(mime)) return 'aac'
+  if (/mp4/i.test(mime)) return 'mp4'
   if (/wav/i.test(mime)) return 'wav'
   if (/mpeg|mp3/i.test(mime)) return 'mp3'
   return 'png'
@@ -711,9 +729,9 @@ async function uploadComfyMedia(opts: {
   onProgress?: (msg: string) => void
 }): Promise<string> {
   const { bytes, mime } = dataUrlToBytes(opts.dataUrl)
-  const name = `aicust-${Date.now().toString(36)}.${extOfMime(mime)}`
+  const name = `aicust-${Date.now().toString(36)}-${crypto.randomUUID()}.${extOfMime(mime)}`
   const { bodyBase64, contentType } = buildMultipart({ overwrite: 'true' }, { name, mime, bytes }, 'image')
-  opts.onProgress?.('上传参考图到 ComfyUI…')
+  opts.onProgress?.(mime.startsWith('audio/') ? '上传参考声音到 ComfyUI…' : '上传参考图到 ComfyUI…')
   const res = await providerHttp(joinUrl(trimSlash(opts.baseUrl), '/upload/image'), {
     method: 'POST',
     headers: buildAuthHeader(opts.apiKey || '', {
@@ -754,12 +772,15 @@ export async function comfyPromptGenerate(opts: {
   prompt: string
   negative?: string
   imageDataUrl?: string
+  /** Ordered references for image editing; single imageDataUrl remains supported. */
+  imageDataUrls?: string[]
   /** 尾帧（首尾帧工作流） */
   imageEndDataUrl?: string
   /** 蒙版（局部重绘） */
   maskDataUrl?: string
   /** 音频（数字人口播） */
   audioDataUrl?: string
+  audioDataUrls?: string[]
   seed?: number
   width?: number
   height?: number
@@ -769,9 +790,13 @@ export async function comfyPromptGenerate(opts: {
   adapter?: AdapterConfig
   signal?: AbortSignal
   kind?: 'image' | 'video'
+  /** Internal polling budget for expensive native workflows; does not alter HTTP timeouts. */
+  generationTimeoutMs?: number
   onProgress?: (msg: string) => void
-}): Promise<{ blob: Blob; mimeType: string }> {
+}): Promise<{ blob: Blob; mimeType: string; generation?: Partial<GenerationRecord> }> {
   const base = trimSlash(opts.baseUrl)
+  const referenceImages = opts.imageDataUrls?.length ? opts.imageDataUrls : opts.imageDataUrl ? [opts.imageDataUrl] : []
+  const referenceAudios = opts.audioDataUrls?.length ? opts.audioDataUrls : opts.audioDataUrl ? [opts.audioDataUrl] : []
   const adapter = opts.adapter || {}
   const submitPath = adapter.path || '/prompt'
   const pollPath = adapter.pollPath || '/history/{id}'
@@ -793,27 +818,14 @@ export async function comfyPromptGenerate(opts: {
   }
   // 老模板带 {{prompt}} 占位：先按占位替换（image 用上传后的文件名，data URL 对 Comfy 无效）
   const hasPlaceholders = /\{\{(prompt|negative|image)\}\}/.test(adapter.workflowTemplate)
+  // Defer upload until the workflow and media mapping have been validated.
+  const imagePlaceholder = '__juliu_reference_upload__'
   let payload: any
   if (hasPlaceholders) {
-    let uploadedName = ''
-    if (opts.imageDataUrl) {
-      try {
-        uploadedName = await uploadComfyMedia({
-          baseUrl: base,
-          dataUrl: opts.imageDataUrl,
-          apiKey: opts.apiKey,
-          adapter,
-          signal: opts.signal,
-          onProgress: opts.onProgress
-        })
-      } catch (e: any) {
-        throw new Error(`[comfyui] 参考图上传失败：${e?.message || e}`)
-      }
-    }
     payload = fillWorkflowTemplate(adapter.workflowTemplate, {
       prompt: opts.prompt,
       negative: opts.negative || '',
-      image: uploadedName
+      image: referenceImages.length ? imagePlaceholder : ''
     })
   } else {
     payload = JSON.parse(adapter.workflowTemplate)
@@ -832,22 +844,45 @@ export async function comfyPromptGenerate(opts: {
     inputMap = guessInputMap(payload)
   }
   inputMap = validateInputMap(payload, inputMap)
+  if (referenceImages.length && adapter.workflowTemplate.includes('{{image}}')) {
+    const bindings = [...inputMap.bindings]
+    for (const [nodeId, node] of Object.entries(payload.prompt || {}) as [string, any][]) {
+      for (const [field, value] of Object.entries(node?.inputs || {})) {
+        if (value === imagePlaceholder && !bindings.some(b => b.nodeId === nodeId && b.field === field)) {
+          bindings.push({ role: 'image', nodeId, field, mediaMode: 'upload' })
+        }
+      }
+    }
+    inputMap = { ...inputMap, bindings }
+  }
+  if ((opts.kind || 'image') === 'image') withFlux3Attention(payload)
+  if ((opts.kind || 'image') === 'image' && referenceImages.length) {
+    inputMap = withComfyImageReference(payload, inputMap, referenceImages.length)
+  }
+  if (opts.kind === 'video') validateComfyVideoReferences(payload, inputMap, referenceImages.length, Boolean(opts.imageEndDataUrl), referenceAudios.length)
+  if ((opts.kind || 'image') === 'image' && opts.width && opts.height) {
+    inputMap = withComfyImageSizeMap(payload, inputMap)
+  }
   const mediaSources: Partial<Record<ComfyInputRole, string>> = {
-    image: opts.imageDataUrl,
+    image: referenceImages[0],
     imageEnd: opts.imageEndDataUrl,
     mask: opts.maskDataUrl,
     audio: opts.audioDataUrl
   }
   const uploaded: Partial<Record<ComfyInputRole, string>> = {}
+  const uploadedImages: string[] = []
+  const uploadedAudios: string[] = []
   for (const b of inputMap.bindings) {
     if (!isMediaRole(b.role)) continue
-    const src = mediaSources[b.role]
+    const imageIndex = b.imageIndex ?? 0
+    const audioIndex = b.audioIndex ?? 0
+    const src = b.role === 'image' ? referenceImages[imageIndex] : b.role === 'audio' ? referenceAudios[audioIndex] : mediaSources[b.role]
     if (!src) continue
     const mode = b.mediaMode || 'upload'
     if (mode !== 'upload') continue
-    if (uploaded[b.role]) continue
+    if (b.role === 'image' ? uploadedImages[imageIndex] : b.role === 'audio' ? uploadedAudios[audioIndex] : uploaded[b.role]) continue
     try {
-      uploaded[b.role] = await uploadComfyMedia({
+      const name = await uploadComfyMedia({
         baseUrl: base,
         dataUrl: src,
         apiKey: opts.apiKey,
@@ -855,6 +890,9 @@ export async function comfyPromptGenerate(opts: {
         signal: opts.signal,
         onProgress: opts.onProgress
       })
+      if (b.role === 'image') uploadedImages[imageIndex] = name
+      else if (b.role === 'audio') uploadedAudios[audioIndex] = name
+      else uploaded[b.role] = name
     } catch (e: any) {
       throw new Error(
         `[comfyui] ${COMFY_ROLE_LABEL[b.role]}上传失败：${e?.message || e}。该工作流需要先把素材传到 Comfy 的 input 目录。`
@@ -864,7 +902,11 @@ export async function comfyPromptGenerate(opts: {
   const values: ComfyInjectValues = {
     prompt: opts.prompt,
     negative: opts.negative || '',
-    image: opts.imageDataUrl,
+    image: referenceImages[0],
+    images: referenceImages,
+    uploadedImages,
+    audios: referenceAudios,
+    uploadedAudios,
     imageEnd: opts.imageEndDataUrl,
     mask: opts.maskDataUrl,
     audio: opts.audioDataUrl,
@@ -886,6 +928,7 @@ export async function comfyPromptGenerate(opts: {
   }
   opts.onProgress?.(`已注入：${writes.slice(0, 3).join('、')}`)
 
+  const generation = { ...comfyGenerationRecord(payload), prompt: opts.prompt }
   opts.onProgress?.('提交 ComfyUI 队列…')
   const submitUrl = joinUrl(base, submitPath)
   const submit = await providerHttp(submitUrl, {
@@ -907,11 +950,20 @@ export async function comfyPromptGenerate(opts: {
     throw new Error(`[comfyui] 提交成功但没有 prompt_id：${JSON.stringify(submitJson).slice(0, 200)}`)
   }
 
+  Object.assign(generation, { promptId })
+  opts.onProgress?.('ComfyUI 已接收任务，等待生成结果…')
   const started = Date.now()
-  const timeoutMs = opts.kind === 'video' ? 15 * 60_000 : 6 * 60_000
+  const requestedTimeout = opts.generationTimeoutMs
+  const timeoutMs = requestedTimeout && Number.isFinite(requestedTimeout)
+    ? Math.max(60_000, Math.min(120 * 60_000, requestedTimeout))
+    : opts.kind === 'video' ? 15 * 60_000 : 6 * 60_000
   while (Date.now() - started < timeoutMs) {
     if (opts.signal?.aborted) throw new Error('已取消')
     await new Promise((r) => setTimeout(r, 1500))
+    const elapsed = Math.floor((Date.now() - started) / 1000)
+    const waited = elapsed >= 60 ? `${Math.floor(elapsed / 60)}分${elapsed % 60}秒` : `${elapsed}秒`
+    // An empty /history is normal while queued or executing; it must not freeze the submit label.
+    opts.onProgress?.(`等待 ComfyUI 生成结果…（已等待 ${waited}，含排队时间）`)
     const pollUrl = joinUrl(base, pollPath.replace(/\{id\}/g, encodeURIComponent(promptId)))
     const poll = await providerHttp(pollUrl, {
       method: 'GET',
@@ -932,7 +984,7 @@ export async function comfyPromptGenerate(opts: {
     const outputs = entry.outputs || entry
     const foundOutputs: Array<{ filename: string; subfolder?: string; type?: string }> = []
     const visit = (node: any) => {
-      if (!node || foundOutputs.length) return
+      if (!node) return
       if (Array.isArray(node)) {
         node.forEach(visit)
         return
@@ -949,12 +1001,20 @@ export async function comfyPromptGenerate(opts: {
       for (const v of Object.values(node)) visit(v)
     }
     visit(outputs)
-    const fileMeta = foundOutputs[0] || null
+    const mediaKind = (name: string) => /\.(mp4|webm|mov|m4v|mkv|avi)(?:$|[?#])/i.test(name)
+      ? 'video' : /\.(png|jpe?g|webp|gif|bmp)(?:$|[?#])/i.test(name) ? 'image' : 'unknown'
+    const wanted = opts.kind || 'image'
+    const fileMeta = foundOutputs.find((item) => mediaKind(item.filename) === wanted)
+      || foundOutputs.find((item) => mediaKind(item.filename) === 'unknown') || null
+    if (!fileMeta && foundOutputs.length) {
+      throw new Error(`[comfyui] 工作流没有输出 ${wanted === 'video' ? '视频' : '图片'} 文件，请检查保存节点`)
+    }
 
     const direct =
       (adapter.resultJsonPath ? getByJsonPath(entry, adapter.resultJsonPath) : null) ||
-      findFirstMediaUrl(entry)
+      (!fileMeta ? findFirstMediaUrl(outputs) : null)
     if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) {
+      opts.onProgress?.('下载 ComfyUI 输出…')
       const r = await providerHttp(direct, {
         method: 'GET',
         headers: buildAuthHeader(opts.apiKey || '', adapter),
@@ -965,6 +1025,7 @@ export async function comfyPromptGenerate(opts: {
       const blob = await r.blob()
       return {
         blob,
+        generation,
         mimeType: blob.type || (opts.kind === 'video' ? 'video/mp4' : 'image/png')
       }
     }
@@ -997,7 +1058,7 @@ export async function comfyPromptGenerate(opts: {
             : name.endsWith('.jpg') || name.endsWith('.jpeg')
               ? 'image/jpeg'
               : 'image/png')
-      return { blob, mimeType: mime }
+      return { blob, mimeType: mime, generation }
     }
     opts.onProgress?.('ComfyUI 生成中…')
   }

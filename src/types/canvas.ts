@@ -21,7 +21,9 @@ export type CanvasNodeType =
 /** 图生视频节点模型。默认 H3 15s；h3-v5 为 10 秒且可选 1080p；万相走百炼同一套 Key。 */
 export type VideoGenModel = 'h3' | 'h3-v5' | 'wan-prime'
 
-export type VideoResolution = '768p' | '1080p'
+export type H3ImageResolution = 'auto' | '1mp' | '4mp' | '480p' | '720p' | '1080p' | '1440p' | '2160p' | '8mp' | '12mp' | '16mp' | '20mp' | 'custom'
+
+export type VideoResolution = '480p' | '720p' | '768p' | '1080p'
 
 /** H3 出片方式。reference=多图参考（当前默认）；fl2va=首尾帧。 */
 export type H3VideoGenMode = 'reference' | 'fl2va'
@@ -58,7 +60,7 @@ export function stillModeForVideoModel(
   if (raw === 'identity' || raw === 'keyframe' || raw === 'storyboard') return raw
   const workflow = String(profile?.workflowId || '').toLowerCase()
   const provider = String(profile?.provider || '').toLowerCase()
-  if (provider === 'dashscope' || workflow.includes('wan')) return 'keyframe'
+  if (provider === 'dashscope' || provider === 'dashscope-token-plan' || workflow.includes('wan') || workflow.startsWith('happyhorse-')) return 'keyframe'
   return 'identity'
 }
 
@@ -120,19 +122,34 @@ export interface CanvasNode {
     kind?: string
     prompt?: string
     referenceAssetIds?: string[]
+    /** Optional standalone sound conditioning, independent of image slots and output audio. */
+    referenceAudioAssetId?: string
+    referenceAudioAssetIds?: string[]
+    /** Stable display order across image and audio references. */
+    videoReferenceOrder?: string[]
     /** 通过画布连线继承参考图的上游节点，顺序即图1、图2…… */
     referenceSourceNodeIds?: string[]
     outputAssetId?: string
     duration?: number
     /** 节点自己的画幅；为空时只继承项目默认值，不反向修改其他节点。 */
     aspectRatio?: import('./project').AspectRatio
+    /** Node-bound image endpoint and API model; global settings only provide initial defaults. */
+    imageProfileId?: string
+    imageModel?: string
+    generationSeed?: number
+    /** Image output dimensions; H3 uses a minimum 4MP generation canvas before resizing. */
+    imageResolution?: H3ImageResolution
+    imageWidth?: number
+    imageHeight?: number
     videoModel?: VideoGenModel
     /** 当前节点锁定的视频接入，避免不同供应商配置互相串用。 */
     videoProfileId?: string
     /** 这一镜出视频时用什么参考图；切模型时写入，决定画布是否铺分镜关键帧 */
     videoStillMode?: VideoStillMode
-    /** h3-v5 可选 1080p，其余固定 768p */
+    /** 原生H3：480p/720p/1080p；云端h3-v5：768p/1080p。 */
     videoResolution?: VideoResolution
+    /** 原生H3输出音轨；缺省开启。关闭不改变音视频联合采样。 */
+    videoAudioEnabled?: boolean
     /** H3：参考图生成（默认）或首尾帧 */
     h3GenMode?: H3VideoGenMode
     firstFrameAssetId?: string

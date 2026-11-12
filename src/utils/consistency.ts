@@ -1,3 +1,5 @@
+import { getVideoConfig } from '@/services/ai/runtime'
+import { isDashScopeEndpoint } from '@/services/ai/dashscopeMedia'
 import type { ID, Project, Scene, Shot, Subject } from '@/types'
 import { sceneForShotPlace, shotMentionsScene } from '@/utils/shotPlace'
 import { lookFromScript, mediumLockText } from '@/utils/visualStyle'
@@ -542,7 +544,11 @@ export function composeShotImagePrompt(
       `这是「${dialogueSpeaker}」的出镜对白镜头。单画面起始构图必须已经明确落在${dialogueSpeaker}身上，让${dialogueSpeaker}成为唯一、无歧义的主视觉，脸和嘴清楚可见；可以用中近景、近景、过肩构图或以${dialogueSpeaker}为主体的双人构图，但其他人只能作为闭嘴倾听或反应者，不能与${dialogueSpeaker}争夺视觉中心。`
     )
   }
-  if (shot.boardAssetId && videoRequiresStoryboard(project)) {
+  const videoCfg = getVideoConfig(shot.videoProfileId)
+  const nativeWan = isDashScopeEndpoint(videoCfg) && !videoCfg.adapter?.type && /^(?:wan2\.6-|wan3\.0-video$|happyhorse-1\.1-)/.test(videoCfg.workflowId)
+  if (nativeWan) {
+    parts.push('只生成一张完整单画面首帧，绝对不要四宫格、六格、边框、编号或拼贴。人物和场景参考图只用于保持一致性。')
+  } else if (shot.boardAssetId && videoRequiresStoryboard(project)) {
     parts.push(
       filmChapter
         ? '附件中的彩色四/八宫格电影故事看板按左上到右下展示动作过程。视频起始帧采用第一格的开场构图、站位、朝向、天气和道具状态，后续动作顺序由文字提示承接；只生成一张完整的单画面起始帧，绝对不要复制宫格边框、编号或拼贴版式。'

@@ -1,0 +1,5 @@
+case,shot,route,model,workflow,seed,prompt_version,task_id,elapsed_seconds,output_file,actual_duration,identity_check,status
+忘带钥匙,1,cloud,,,,,,,,,,not-run
+忘带钥匙,1,local-image,,,,,,,,,,not-run
+忘带钥匙,1,local-t2v,,,,,,,,,,not-run
+忘带钥匙,1,local-i2v,,,,,,,,,,not-run

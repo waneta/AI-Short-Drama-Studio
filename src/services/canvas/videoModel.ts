@@ -13,6 +13,7 @@ import {
 } from '@/types/canvas'
 import { stillModeFromNode } from '@/utils/videoStill'
 import { rebuildCanvasGraph } from './layout'
+import { isNativeH3VideoProfile, normalizeNativeH3Resolution } from '@/services/ai/nativeH3VideoSettings'
 
 /** 节点切视频模型时同时写入参考图策略，必要时重铺「分镜关键帧」分组。 */
 export function applyShotVideoModel(nodeId: string, model: VideoGenModel, profileId?: string) {
@@ -23,6 +24,7 @@ export function applyShotVideoModel(nodeId: string, model: VideoGenModel, profil
   // 「H3 v5」这组选项写明走 AutoDL 令牌。没点具体接入时不能回落到当前 Zealman。
   const selectedProfileId = profileId
     || (model === 'h3' || model === 'h3-v5' ? autodlVideoProfileId() : undefined)
+  if (!selectedProfileId && (model === 'h3' || model === 'h3-v5')) throw new Error('内置H3需要已配置的AutoDL接入，请选择具体视频接入或先配置AutoDL。')
   const selectedProfile = selectedProfileId
     ? settings.config.videos.find((profile) => profile.id === selectedProfileId)
     : undefined
@@ -37,8 +39,10 @@ export function applyShotVideoModel(nodeId: string, model: VideoGenModel, profil
     videoModel: model,
     videoProfileId: selectedProfileId,
     videoStillMode: nextStill,
+    videoTaskId: undefined,
     h3GenMode: nextH3Mode,
-    videoResolution: normalizeVideoResolution(node.data.videoResolution, model),
+    videoResolution: model === 'h3' && isNativeH3VideoProfile(selectedProfile || settings.config.video)
+      ? normalizeNativeH3Resolution(node.data.videoResolution) : normalizeVideoResolution(node.data.videoResolution, model),
     ...(node.type === 'videoGen'
       ? { duration: Math.min(max, Math.max(min, Math.round(node.data.duration || min))) }
       : {})
@@ -50,6 +54,7 @@ export function applyShotVideoModel(nodeId: string, model: VideoGenModel, profil
       project.updateShot(shot.id, {
         duration: Math.min(max, Math.max(min, Math.round(shot.duration || min))),
         videoProfileId: selectedProfileId,
+        videoTaskId: undefined,
         h3GenMode: nextH3Mode
       })
     }
@@ -67,7 +72,6 @@ export function applyShotVideoModel(nodeId: string, model: VideoGenModel, profil
 export function applyShotVideoProfile(nodeId: string, profileId: string) {
   const settings = useSettingsStore()
   if (!settings.config.videos.some((profile) => profile.id === profileId)) return
-  settings.selectVideo(profileId)
   applyShotVideoModel(nodeId, 'h3', profileId)
 }
 
@@ -75,9 +79,11 @@ export function applyShotVideoProfile(nodeId: string, profileId: string) {
 export function syncH3ShotStillModes(stillMode: VideoStillMode) {
   const project = useProjectStore()
   const p = project.current
+  const activeProfileId = useSettingsStore().config.activeVideoId
   if (!p?.canvas) return
   for (const node of p.canvas.nodes) {
     if (node.type !== 'shotVideo') continue
+    if (node.data.videoProfileId && node.data.videoProfileId !== activeProfileId) continue
     const model = normalizeVideoGenModel(node.data.videoModel)
     if (model === 'h3-v5' || model === 'wan-prime') continue
     project.patchCanvasNode(node.id, { videoStillMode: stillMode })

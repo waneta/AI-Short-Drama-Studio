@@ -1,3 +1,6 @@
+import { wan27ImageResolution, wan27ImageSizeIssue } from './wan27ImageSize'
+import { generationRecord } from './generationRecord'
+import type { GenerationRecord } from '@/types'
 /**
  * AI 图片生成（OpenAI 兼容 Images API）
  *
@@ -10,7 +13,12 @@
  */
 
 import { getAIMode } from './client'
+import { dashscopeImage, isDashScopeEndpoint } from './dashscopeMedia'
 import { getImageConfig } from './runtime'
+import { comfyImageWorkflowModel } from './comfyImageWorkflow'
+import { nativeH3ImageSize, h3ImageOutputSize, withH3ImageOutputSize } from './comfyH3Image'
+import { resolveImageReferenceMentions } from './imageReferenceMentions'
+import { comfyImageSeed } from './comfyImageSeed'
 import { generateMockImage } from './mock'
 import {
   httpCustomImageGenerate,
@@ -24,17 +32,23 @@ import {
   zealmanImageWorkflowById,
   ZEALMAN_IMAGE_WORKFLOWS
 } from './zealman'
-import type { VisualStyle, AspectRatio } from '@/types'
+import type { VisualStyle, AspectRatio, H3ImageResolution } from '@/types'
 import { abortableDelay, throwIfAborted } from './abort'
 
 export interface ImageGenInput {
+  imageProfileId?: string
   prompt: string
   style: VisualStyle
   width: number
   height: number
   /** 比例标签（'16:9' / '9:16' 等），写到 prompt 最前面 */
   aspectRatio?: AspectRatio
+  h3Resolution?: H3ImageResolution
+  h3CustomWidth?: number
+  h3CustomHeight?: number
   n?: number
+  /** 原生Comfy图片默认随机；显式提供可复现同一结果。 */
+  seed?: number
   /** 参考图（图生图/多图融合），最多 10 张；本项目通常 1–3 张人设/场景 */
   referenceImages?: Blob[]
   /** 每张参考图的语义（会写进 prompt，告诉模型第几张是什么） */
@@ -45,6 +59,7 @@ export interface ImageGenInput {
 }
 
 export interface ImageGenOutput {
+  generation?: GenerationRecord
   blob: Blob
   mimeType: string
   prompt: string
@@ -53,16 +68,14 @@ export interface ImageGenOutput {
 const log = (msg: string) =>
   console.log('%c[image]', 'color:#f59e0b;font-weight:600', msg)
 
-function imageConfig(modelOverride?: string) {
-  const cfg = getImageConfig()
-  return {
-    ...cfg,
-    model: modelOverride?.trim() || cfg.model
-  }
+const resolvedImageConfigs = new WeakMap<ImageGenInput, ReturnType<typeof getImageConfig>>()
+function imageConfig(input: ImageGenInput) {
+  const cfg = resolvedImageConfigs.get(input) || getImageConfig(input.imageProfileId)
+  return { ...cfg, model: input.model?.trim() || cfg.model }
 }
 
 async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> {
-  const cfg = imageConfig(input.model)
+  const cfg = imageConfig(input)
   const adapterType = resolveImageAdapter(cfg)
   const prompt = withGptImageQuality(buildPrompt(input, Boolean(input.referenceImages?.length)), cfg.model)
   if (adapterType === 'http-custom') {
@@ -80,7 +93,7 @@ async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> 
       extraBody: {
         ...(imageUrls.length ? { image_urls: imageUrls } : {}),
         ...(input.aspectRatio ? { aspect_ratio: input.aspectRatio } : {}),
-        n: 1
+        n: 1, width: input.width, height: input.height
       },
       signal: input.signal
     })
@@ -88,20 +101,44 @@ async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> 
   }
   if (adapterType === 'comfyui-prompt' || adapterType === 'comfyui-workflow') {
     log(`→ ComfyUI 生图 · ${adapterType}`)
-    let imageDataUrl: string | undefined
-    if (input.referenceImages?.[0]) {
-      imageDataUrl = await blobToDataUri(input.referenceImages[0])
+    const imageDataUrls: string[] = []
+    for (const image of input.referenceImages || []) imageDataUrls.push(await blobToDataUri(image))
+    const graph = JSON.parse(cfg.adapter?.workflowTemplate || '{}')
+    const actual = comfyImageWorkflowModel(graph)
+    let adapter = cfg.adapter
+    let size = { width: input.width, height: input.height }
+    if (actual === 'MiniMax H3 Image') {
+      const ratio = input.aspectRatio?.split(':').map(Number)
+      const output = input.h3Resolution
+        ? h3ImageOutputSize(input.h3Resolution, ratio?.[0] || input.width, ratio?.[1] || input.height,
+          input.h3CustomWidth, input.h3CustomHeight)
+        : nativeH3ImageSize(input.width, input.height, 2048 * 2048)
+      size = nativeH3ImageSize(output.width, output.height)
+      if (size.width !== output.width || size.height !== output.height) {
+        withH3ImageOutputSize(graph, output.width, output.height)
+        adapter = { ...cfg.adapter, workflowTemplate: JSON.stringify(graph) }
+      }
     }
-    const { blob, mimeType } = await comfyPromptGenerate({
+    if (actual !== 'MiniMax H3 Image' && input.h3Resolution && input.h3Resolution !== 'auto') {
+      size = { width: Math.ceil(input.width / 32) * 32, height: Math.ceil(input.height / 32) * 32 }
+      if (size.width !== input.width || size.height !== input.height) {
+        withH3ImageOutputSize(graph, input.width, input.height)
+        adapter = { ...cfg.adapter, workflowTemplate: JSON.stringify(graph) }
+      }
+    }
+    const { blob, mimeType, generation } = await comfyPromptGenerate({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
       prompt,
-      imageDataUrl,
-      adapter: cfg.adapter,
+      imageDataUrls,
+      seed: comfyImageSeed(input.seed),
+      width: size.width,
+      height: size.height,
+      adapter,
       signal: input.signal,
       kind: 'image'
     })
-    return { blob, mimeType, prompt: input.prompt }
+    return { blob, mimeType, prompt: input.prompt, generation: generation as GenerationRecord }
   }
   throw new Error(`[image] 未知适配器 ${adapterType}`)
 }
@@ -256,6 +293,20 @@ function pickLegacySize(ar?: AspectRatio, w?: number, h?: number): string {
   return '1024x1024'
 }
 
+/** GPT Image always returns base64 and uses different sizes from the legacy Images API. */
+function imageApiParameters(model: string, input: ImageGenInput): { size: string; response_format?: 'b64_json' } {
+  const gptImage = /^(gpt[-_]image(?:[-_]|$)|chatgpt-image-latest$)/i.test(model.trim())
+  if (!gptImage) {
+    return { size: pickLegacySize(input.aspectRatio, input.width, input.height), response_format: 'b64_json' }
+  }
+
+  // These standard sizes work across GPT Image versions, including models without custom sizes.
+  const [width, height] = input.aspectRatio
+    ? input.aspectRatio.split(':').map(Number)
+    : [input.width, input.height]
+  return { size: width === height ? '1024x1024' : width > height ? '1536x1024' : '1024x1536' }
+}
+
 function blobToDataUri(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -293,13 +344,20 @@ async function blobToChatImageDataUri(
 }
 
 function buildPrompt(input: ImageGenInput, _withRefs: boolean): string {
-  const model = imageConfig(input.model).model
-  return withGptImageQuality(input.prompt, model)
+  const cfg = imageConfig(input)
+  const model = cfg.model
+  let nativeFormat: boolean | 'flux3' | 'h3' = false
+  try {
+    const actual = resolveImageAdapter(cfg) === 'comfyui-prompt'
+      ? comfyImageWorkflowModel(JSON.parse(cfg.adapter?.workflowTemplate || '')) : undefined
+    nativeFormat = actual === 'MiniMax H3 Image' ? 'h3' : actual === 'FLUX 3 Image Klein' ? 'flux3' : actual === 'Qwen-Image 2.1'
+  } catch { /* Non-Comfy providers use plain image numbers. */ }
+  return withGptImageQuality(resolveImageReferenceMentions(input.prompt, input.referenceImages?.length || 0, nativeFormat), model)
 }
 
 /** Seedream：统一走 /images/generations，优先返回 b64_json */
 async function realSeedream(input: ImageGenInput): Promise<ImageGenOutput> {
-  const { baseUrl, apiKey, model } = imageConfig(input.model)
+  const { baseUrl, apiKey, model } = imageConfig(input)
   if (!baseUrl || !apiKey) {
     throw new Error('[image] 未配置 VITE_IMAGE_BASE_URL / VITE_IMAGE_API_KEY')
   }
@@ -349,9 +407,9 @@ async function realSeedream(input: ImageGenInput): Promise<ImageGenOutput> {
   return { blob, mimeType, prompt: input.prompt }
 }
 
-/** 旧 gpt-image 等：文生图 */
+/** OpenAI-compatible Images API: GPT Image and legacy model parameters differ. */
 async function realLegacyGenerate(input: ImageGenInput): Promise<ImageGenOutput> {
-  const { baseUrl, apiKey, model } = imageConfig(input.model)
+  const { baseUrl, apiKey, model } = imageConfig(input)
   if (!baseUrl || !apiKey) {
     throw new Error('[image] 未配置 VITE_IMAGE_BASE_URL / VITE_IMAGE_API_KEY')
   }
@@ -367,8 +425,7 @@ async function realLegacyGenerate(input: ImageGenInput): Promise<ImageGenOutput>
       model,
       prompt: fullPrompt,
       n: input.n ?? 1,
-      size: pickLegacySize(input.aspectRatio, input.width, input.height),
-      response_format: 'b64_json'
+      ...imageApiParameters(model, input)
     }),
     signal: input.signal
   })
@@ -382,9 +439,9 @@ async function realLegacyGenerate(input: ImageGenInput): Promise<ImageGenOutput>
   return { blob, mimeType, prompt: input.prompt }
 }
 
-/** 旧 gpt-image：/images/edits multipart */
+/** OpenAI-compatible reference image editing via /images/edits multipart. */
 async function realLegacyEdit(input: ImageGenInput): Promise<ImageGenOutput> {
-  const { baseUrl, apiKey, model } = imageConfig(input.model)
+  const { baseUrl, apiKey, model } = imageConfig(input)
   if (!baseUrl || !apiKey) {
     throw new Error('[image] 未配置 VITE_IMAGE_BASE_URL / VITE_IMAGE_API_KEY')
   }
@@ -396,8 +453,9 @@ async function realLegacyEdit(input: ImageGenInput): Promise<ImageGenOutput> {
   const form = new FormData()
   form.append('model', model)
   form.append('prompt', fullPrompt)
-  form.append('size', pickLegacySize(input.aspectRatio, input.width, input.height))
-  form.append('response_format', 'b64_json')
+  const parameters = imageApiParameters(model, input)
+  form.append('size', parameters.size)
+  if (parameters.response_format) form.append('response_format', parameters.response_format)
 
   const refs = input.referenceImages.slice(0, 4)
   for (let i = 0; i < refs.length; i++) {
@@ -431,7 +489,7 @@ async function realZealmanImage(
   input: ImageGenInput,
   onProgress?: (msg: string) => void
 ): Promise<ImageGenOutput> {
-  const cfg = imageConfig(input.model)
+  const cfg = imageConfig(input)
   const root = normalizeZealmanBaseUrl(String(cfg.baseUrl || '').trim())
   if (!root) throw new Error('[image] Zealman 生图需要先填写镜像 Base URL（设置 → Zealman 镜像）')
   const workflow = zealmanImageWorkflowById(cfg.model) || ZEALMAN_IMAGE_WORKFLOWS[0]
@@ -515,16 +573,20 @@ async function realZealmanImage(
   throw new Error('[image] Zealman 生图超过 15 分钟，已停止轮询')
 }
 
-export async function generateImage(
+async function runImageGeneration(
   input: ImageGenInput,
   onProgress?: (msg: string) => void
 ): Promise<ImageGenOutput> {
   onProgress?.('准备生成图片...')
-  const model = imageConfig(input.model).model
+  const model = imageConfig(input).model
 
   if (getAIMode() === 'real') {
-    const cfg = imageConfig(input.model)
+    const cfg = imageConfig(input)
     const adapterType = resolveImageAdapter(cfg)
+    if (isDashScopeEndpoint(cfg) && !cfg.adapter?.type) {
+      onProgress?.('百炼千问生图...')
+      return await dashscopeImage(cfg, { ...input, prompt: buildPrompt(input, Boolean(input.referenceImages?.length)) })
+    }
     if (adapterType === 'zealman-workflow') {
       onProgress?.('Zealman 出图...')
       return await realZealmanImage(input, onProgress)
@@ -634,4 +696,39 @@ async function generateMockWithReferences(
       resolve({ blob: b!, mimeType: 'image/png', prompt: input.prompt })
     )
   )
+}
+
+export async function generateImage(input: ImageGenInput, onProgress?: (msg: string) => void): Promise<ImageGenOutput> {
+  const startedAt = performance.now()
+  const cfg: ReturnType<typeof getImageConfig> = JSON.parse(JSON.stringify(imageConfig(input)))
+  const graph = (() => { try { return JSON.parse(cfg.adapter?.workflowTemplate || '{}') } catch { return {} } })()
+  const actual = comfyImageWorkflowModel(graph)
+  const wan = isDashScopeEndpoint(cfg) && !cfg.adapter?.type
+  let resolution = actual === 'MiniMax H3 Image' && input.h3Resolution === 'auto' ? '4mp' : input.h3Resolution
+  const ratio = input.aspectRatio?.split(':').map(Number)
+  if (wan) {
+    resolution = wan27ImageResolution(cfg.model, resolution, ratio?.[0] || input.width, ratio?.[1] || input.height, input.referenceImages?.length)
+    if (resolution === 'custom') {
+      const issue = wan27ImageSizeIssue(cfg.model, input.h3CustomWidth!, input.h3CustomHeight!, input.referenceImages?.length)
+      if (issue) throw new Error(issue)
+    }
+  }
+  let size = { width: input.width, height: input.height }
+  if (resolution && resolution !== 'auto') {
+    const ratio = input.aspectRatio?.split(':').map(Number)
+    size = h3ImageOutputSize(resolution, ratio?.[0] || input.width, ratio?.[1] || input.height, input.h3CustomWidth, input.h3CustomHeight)
+  }
+  if (wan) {
+    const issue = wan27ImageSizeIssue(cfg.model, size.width, size.height, input.referenceImages?.length)
+    if (issue) throw new Error(issue)
+  }
+  const request = { ...input, ...size, h3Resolution: resolution, imageProfileId: cfg.id, model: input.model || cfg.model }
+  resolvedImageConfigs.set(request, cfg)
+  const record = generationRecord('image', cfg, request)
+  record.model = actual || request.model || cfg.model
+  try {
+    const result = await runImageGeneration(request, onProgress)
+    return { ...result, generation: { ...record, ...result.generation,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)) } }
+  } finally { resolvedImageConfigs.delete(request) }
 }

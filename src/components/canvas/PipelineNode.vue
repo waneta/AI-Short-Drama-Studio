@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { Handle, Position, useVueFlow } from '@vue-flow/core'
 import { useAssetsStore, useLibraryStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
 import { runCanvasNode, optimizeShotVideoPrompt, regenerateShotFrame, grabVideoLastFrameNode } from '@/services/canvas/runner'
-import { isNodeRunning } from '@/services/canvas/jobs'
+import { isNodeRunning, nodeJobStartedAt } from '@/services/canvas/jobs'
 import { needsPlayReview } from '@/services/canvas/playGate'
 import { cssAspectRatio } from '@/services/canvas/layout'
 import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
@@ -17,11 +17,18 @@ import NodeBusyOverlay from '@/components/canvas/NodeBusyOverlay.vue'
 import AssetPicker from '@/components/common/AssetPicker.vue'
 import ParamSelect from '@/components/common/ParamSelect.vue'
 import ImageModelSelect from '@/components/settings/ImageModelSelect.vue'
+import { comfyImageModelOption } from '@/services/ai/comfyImageWorkflow'
 import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import AspectRatioSeg from '@/components/common/AspectRatioSeg.vue'
-import VideoResolutionSeg from '@/components/common/VideoResolutionSeg.vue'
+import GenerationDetails from '@/components/common/GenerationDetails.vue'
+import { displayVideoReferenceTokens } from '@/services/ai/videoReferenceTokens'
+import { referenceAudioIds, videoReferenceBindings } from '@/services/canvas/videoReferences'
+import { videoRefSlots } from '@/utils/consistency'
+import VideoReferenceEditor from '@/components/canvas/VideoReferenceEditor.vue'
+import AudioReferenceControl from '@/components/canvas/AudioReferenceControl.vue'
+import NativeH3VideoControls from '@/components/common/NativeH3VideoControls.vue'
 import CanvasToolbarIcon from '@/components/canvas/CanvasToolbarIcon.vue'
 import { canBuildExport } from '@/utils/timeline'
 import { effectiveShotAudioMode, needsExternalTts } from '@/utils/shot'
@@ -306,10 +313,7 @@ const nodeAspectRatio = computed({
   get: () => nodeMeta.value?.data.aspectRatio ?? project.current?.settings.aspectRatio ?? '16:9',
   set: (v: AspectRatio) => {
     project.patchCanvasNode(props.id, { aspectRatio: v })
-    if (type.value === 'shotVideo' && shot.value) project.invalidateShotAssets(shot.value.id, 'video')
-    else if ((type.value === 'shotImage' || type.value === 'shotBoard') && shot.value) {
-      project.invalidateShotAssets(shot.value.id, 'image')
-    }
+    if (type.value === 'shotVideo' && shot.value) project.updateShot(shot.value.id, { videoTaskId: undefined })
   }
 })
 const h3GenMode = computed({
@@ -425,8 +429,9 @@ const metaLine = computed(() => {
     if (!shot.value) return '口播'
     return effectiveShotAudioMode(shot.value) === 'tts' ? '后期 TTS' : 'H3 人声'
   }
-  const model = settings.config.image.model || '出图'
-  return `${model} · ${ar} · ${w}×${h}`
+  const profile = nodeMeta.value?.data.imageProfileId ? settings.config.images.find(p => p.id === nodeMeta.value?.data.imageProfileId) : settings.config.image
+  const model = nodeMeta.value?.data.imageModel || profile?.model || '出图'
+  return `${comfyImageModelOption(profile, model)} · ${ar}`
 })
 
 const genLabel = computed(() => {
@@ -936,7 +941,7 @@ async function downloadAsset() {
 }
 
 function copyPrompt() {
-  const t = promptValue.value.trim()
+  const t = type.value === 'shotVideo' && shot.value && project.current ? displayVideoReferenceTokens(promptValue.value.trim(), videoReferenceBindings(videoRefSlots(shot.value, project.current).map(item => item.id), referenceAudioIds(nodeMeta.value?.data), nodeMeta.value?.data.videoReferenceOrder)) : promptValue.value.trim()
   if (!t) {
     toast.warn('没有提示词')
     return
@@ -1123,7 +1128,11 @@ const cropStyle = computed(() => ({
         {{ isVideoNode ? '▶' : '＋' }}
       </div>
       <span v-if="isVideoNode && durationLabel && !trimOn && !generating && !toolBusy" class="dur">{{ durationLabel }}</span>
-      <NodeBusyOverlay v-if="generating || toolBusy" :label="toolBusy || '生成中'" />
+      <NodeBusyOverlay
+        v-if="generating || toolBusy"
+        :label="toolBusy || '生成中'"
+        :started-at="generating && (isImageNode || isFrameNode || isVideoNode) ? nodeJobStartedAt(props.id) : undefined"
+      />
       <div v-if="status === 'failed' && nodeMeta?.error && !selected" class="fail-dot" :title="nodeMeta.error" />
 
       <div v-if="cropOn" class="crop-mask nodrag nowheel" @mousedown.stop>
@@ -1276,6 +1285,7 @@ const cropStyle = computed(() => ({
           @input="endFramePromptValue = ($event.target as HTMLTextAreaElement).value"
         />
       </div>
+      <VideoReferenceEditor v-else-if="type === 'shotVideo' && !isH3Fl2va" :node-id="props.id" v-model="promptValue" :disabled="generating || optimizingPrompt" />
       <textarea
         v-else
         rows="12"
@@ -1291,17 +1301,19 @@ const cropStyle = computed(() => ({
         :first-hint="shot?.imageAssetId ? '空则用本镜配图' : '请选择首帧'"
       />
       <ShotRefStrip
-        v-else-if="shot && (type === 'shotBoard' || type === 'shotImage' || type === 'shotVideo')"
+        v-else-if="shot && (type === 'shotBoard' || type === 'shotImage')"
         :shot="shot"
-        :mode="type === 'shotVideo' ? 'video' : type === 'shotBoard' ? 'board' : 'image'"
+        :mode="type === 'shotBoard' ? 'board' : 'image'"
       />
       <ShotRefStrip
         v-else-if="type === 'subject' || type === 'sceneProps' || type === 'scene'"
         v-model:extra-ids="extraRefIds"
       />
+      <AudioReferenceControl v-if="type === 'shotVideo' && isH3Fl2va" :node-id="props.id" />
       <div class="prompt-foot">
-        <ImageModelSelect v-if="isImageNode || isFrameNode" />
+        <ImageModelSelect v-if="isImageNode || isFrameNode" :node-id="props.id" />
         <VideoModelSelect
+          :node-id="props.id"
           v-else-if="type === 'shotVideo'"
           v-model="videoModel"
           :profile-id="nodeMeta?.data.videoProfileId"
@@ -1309,26 +1321,7 @@ const cropStyle = computed(() => ({
         />
         <span v-if="type === 'shotVideo' && videoStillHint" class="still-hint">{{ videoStillHint }}</span>
         <span v-else>{{ metaLine }}</span>
-        <AspectRatioSeg
-          v-if="type === 'shotBoard' || type === 'shotImage' || type === 'shotFrames' || type === 'shotVideo'"
-          v-model="nodeAspectRatio"
-          compact
-        />
-        <VideoResolutionSeg
-          v-if="type === 'shotVideo' && videoAllows1080p(videoModel) && !isH3Fl2va"
-          v-model="videoResolution"
-          compact
-        />
-        <ParamSelect
-          v-if="type === 'shotVideo' && shot"
-          class="dur-edit"
-          width="76px"
-          title="时长"
-          :model-value="String(shotDurationValue)"
-          @update:model-value="setShotDuration(Number($event))"
-        >
-          <option v-for="n in durationOptions" :key="n" :value="String(n)">{{ n }} 秒</option>
-        </ParamSelect>
+        <NativeH3VideoControls v-if="type === 'shotVideo'" :node-id="props.id" />
         <button
           v-if="genLabel"
           class="go"
@@ -1343,6 +1336,8 @@ const cropStyle = computed(() => ({
       </div>
     </transition>
 
+    <GenerationDetails v-if="isImageNode || isFrameNode || isVideoNode" :asset-id="assetId" :label="isFrameNode ? '首帧结果参数' : '本次结果参数'" />
+    <GenerationDetails v-if="isFrameNode && shot?.lastFrameAssetId && shot.lastFrameAssetId !== shot.firstFrameAssetId" :asset-id="shot.lastFrameAssetId" label="尾帧结果参数" />
     <Handle id="out" type="source" :position="Position.Right" class="hndl" />
 
     <AssetPicker

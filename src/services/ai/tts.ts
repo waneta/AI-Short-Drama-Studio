@@ -10,6 +10,7 @@
 import { getAIMode } from './client'
 import { spokenTextOnly } from './dialogue'
 import { getTtsConfig } from './runtime'
+import { providerHttp } from './adapters'
 
 export interface TTSInput {
   text: string
@@ -32,8 +33,11 @@ const MAX_CHARS = 580
 const log = (msg: string) =>
   console.log('%c[tts]', 'color:#06b6d4;font-weight:600', msg)
 
-/** qwen-audio-3.0-tts-flash 系统音色（百炼音色列表） */
+/** 按对应模型选择系统音色；Qwen3-TTS 使用 Cherry。 */
 export const TTS_VOICES: { id: string; label: string }[] = [
+  { id: 'longanlingxin', label: '龙安灵心（女·TTS Plus）' },
+  { id: 'longanlufeng', label: '龙安鲁风（男·TTS Plus）' },
+  { id: 'Cherry', label: 'Cherry（Qwen3-TTS）' },
   { id: 'longanhuan_v3.6', label: '龙安欢（女·自然普通话）' },
   { id: 'longjielidou_v3.6', label: '龙杰力豆（男童）' },
   { id: 'longpaopao_v3.6', label: '龙泡泡（女童）' },
@@ -167,16 +171,16 @@ function languageHint(language: string): string | undefined {
 }
 
 async function downloadAudioUrl(audioUrl: string, signal?: AbortSignal): Promise<Blob> {
-  const aResp = await fetch(audioUrl, { signal })
+  const aResp = await providerHttp(audioUrl, { signal })
   if (!aResp.ok) throw new Error(`[TTS] 下载音频失败 ${aResp.status}`)
-  const buf = await aResp.arrayBuffer()
-  const ct = (aResp.headers.get('content-type') || '').toLowerCase()
+  const buf = await aResp.blob()
+  const ct = buf.type.toLowerCase()
   const mime =
     ct.includes('mpeg') || ct.includes('mp3')
       ? 'audio/mpeg'
       : ct.includes('wav')
         ? 'audio/wav'
-        : 'audio/mpeg'
+        : /\.wav(?:[?#]|$)/i.test(audioUrl) ? 'audio/wav' : 'audio/mpeg'
   return new Blob([buf], { type: mime })
 }
 
@@ -212,7 +216,7 @@ async function speechSynthesizer(
   if (hint) input.language_hints = [hint]
   if (instruction) input.instruction = instruction
 
-  const resp = await fetch(`${apiRoot}/services/audio/tts/SpeechSynthesizer`, {
+  const resp = await providerHttp(`${apiRoot}/services/audio/tts/SpeechSynthesizer`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -256,7 +260,7 @@ async function nativeQwen3Speech(
   signal?: AbortSignal
 ): Promise<Blob> {
   const apiRoot = origin.replace(/\/api\/v1$/i, '') + '/api/v1'
-  const resp = await fetch(`${apiRoot}/services/aigc/multimodal-generation/generation`, {
+  const resp = await providerHttp(`${apiRoot}/services/aigc/multimodal-generation/generation`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -294,6 +298,9 @@ async function nativeQwen3Speech(
 /** 模型和音色版本不匹配时，服务偶尔不报错但输出异常发音；这里改成稳定安全音色。 */
 export function compatibleVoice(model: string, requested?: string): string {
   const voice = (requested || '').trim()
+  if (/^qwen-audio-3\.0-tts-plus/i.test(model)) {
+    return ['longanlingxin', 'longanlufeng'].includes(voice) ? voice : 'longanlingxin'
+  }
   if (/^qwen-audio-3\.0-tts-flash/i.test(model)) {
     const safe = new Set([
       'longanhuan_v3.6',
@@ -305,6 +312,7 @@ export function compatibleVoice(model: string, requested?: string): string {
     ])
     return safe.has(voice) ? voice : 'longanhuan_v3.6'
   }
+  if (/^qwen3?-tts/i.test(model)) return voice && !voice.startsWith('long') ? voice : 'Cherry'
   return voice || 'longanhuan_v3.6'
 }
 
@@ -350,13 +358,18 @@ export async function generateSpeech(input: TTSInput): Promise<TTSOutput> {
   const language = input.language || detectSpeechLanguage(text)
   log(`口播文本：${text.slice(0, 80)}${text.length > 80 ? '…' : ''}  lang=${language}`)
 
-  if (getAIMode() !== 'real' || !cfg.apiKey) {
+  if (getAIMode() === 'real' && !cfg.apiKey) throw new Error('[TTS] 当前配音接入没有 API Key')
+  if (getAIMode() !== 'real') {
     log('演示模式：生成占位音轨')
     const blob = mockSpeechWav(text)
     return { blob, mimeType: blob.type, model: 'mock-tts' }
   }
 
   const apiRoot = speechApiRoot(cfg.baseUrl)
+  if (/^qwen3?-tts/i.test(cfg.model)) {
+    const blob = await nativeQwen3Speech(apiRoot, cfg.apiKey, cfg.model, text, voice, language, input.signal)
+    return { blob, mimeType: blob.type, model: cfg.model }
+  }
   const errors: string[] = []
 
   try {
@@ -400,4 +413,9 @@ export async function generateSpeech(input: TTSInput): Promise<TTSOutput> {
   }
 
   throw new Error(errors.join('\n') || 'TTS 失败')
+}
+
+/** Only show built-in voices accepted by the selected model family. */
+export function voicesForModel(model: string) {
+  return TTS_VOICES.filter(v => compatibleVoice(model, v.id) === v.id)
 }
