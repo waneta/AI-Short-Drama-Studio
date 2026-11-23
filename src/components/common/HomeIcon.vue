@@ -1,6 +1,13 @@
 <script setup lang="ts">
 defineProps<{
   name:
+    | 'download'
+    | 'filter'
+    | 'batch'
+    | 'history'
+    | 'tag'
+    | 'star'
+    | 'close'
     | 'scissors'
     | 'mic'
     | 'plus'
@@ -36,7 +43,14 @@ defineProps<{
     stroke-linejoin="round"
     aria-hidden="true"
   >
-    <template v-if="name === 'scissors'">
+    <template v-if="name === 'download'"><path d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4" /></template>
+    <template v-else-if="name === 'filter'"><path d="M4 6h16M7 12h10M10 18h4" /></template>
+    <template v-else-if="name === 'batch'"><rect x="3" y="4" width="4" height="4" rx="1" /><rect x="3" y="15" width="4" height="4" rx="1" /><path d="M11 6h10M11 17h10m-17-6 1.5 1.5L8 10" /></template>
+    <template v-else-if="name === 'history'"><path d="M3 10a9 9 0 1 1 2 8M3 4v6h6M12 7v5l3 2" /></template>
+    <template v-else-if="name === 'tag'"><path d="m3 4 9-1 9 9-9 9-9-9z" /><circle cx="7.5" cy="7.5" r="1" /></template>
+    <template v-else-if="name === 'star'"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z" /></template>
+    <template v-else-if="name === 'close'"><path d="m6 6 12 12M6 18 18 6" /></template>
+    <template v-else-if="name === 'scissors'">
       <circle cx="6" cy="7" r="3" /><circle cx="6" cy="17" r="3" />
       <path d="m8.7 8.4 10.8 6.4M8.7 15.6 19.5 9.2" />
     </template>

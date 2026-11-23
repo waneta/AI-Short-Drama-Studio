@@ -706,6 +706,7 @@ function parseAgentJson(text: string): { say: string; actions: Record<string, un
 
 export function llmSetupReady() {
   try {
+    if (useSettingsStore().config.assistantEngine === 'codex') return true
     const cfg = getLlmConfig()
     return Boolean(cfg.baseUrl && cfg.apiKey)
   } catch {

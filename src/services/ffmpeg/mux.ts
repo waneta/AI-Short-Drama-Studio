@@ -104,3 +104,34 @@ export async function toDigitalHumanWav(
   return { blob, duration }
 }
 
+
+let removeAudioQueue: Promise<unknown> = Promise.resolve()
+
+/** Drop the generated source audio with video stream copy; never edit an existing asset. */
+export function removeVideoAudio(video: Blob, onProgress?: (message: string) => void, signal?: AbortSignal): Promise<Blob> {
+  const run = async () => {
+    const check = () => { if (signal?.aborted) throw new DOMException('任务已取消', 'AbortError') }
+    check()
+    const ffmpeg = await getFFmpeg(onProgress)
+    check()
+    const tag = `tts_silent_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
+    const inputName = `${tag}.input`, outputName = `${tag}.mp4`
+    try {
+      await writeFile(ffmpeg, inputName, video)
+      onProgress?.('后期TTS：正在去除生成视频原声（画面不重编码）…')
+      const code = await ffmpeg.exec(['-i', inputName, '-map', '0:v:0', '-c:v', 'copy', '-an', '-movflags', '+faststart', '-y', outputName])
+      check()
+      if (code !== 0) throw new Error(`视频去除原声失败（FFmpeg ${code}）`)
+      const bytes = await readFile(ffmpeg, outputName)
+      if (!bytes.byteLength) throw new Error('视频去除原声后文件为空')
+      return toBlob(bytes, 'video/mp4')
+    } finally {
+      await ffmpeg.deleteFile(inputName).catch(() => {})
+      await ffmpeg.deleteFile(outputName).catch(() => {})
+    }
+  }
+  // Independent concurrent generations share a worker; use unique files and serialize this operation.
+  const next = removeAudioQueue.then(run, run)
+  removeAudioQueue = next.then(() => undefined, () => undefined)
+  return next
+}

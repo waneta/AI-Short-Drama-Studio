@@ -34,6 +34,14 @@ export function effectiveShotAudioMode(shot: Shot): ShotAudioMode {
   return shot.audioMode ?? (shot.audioAssetId ? 'tts' : 'h3-dialogue')
 }
 
+/** TTS source audio is an explicit per-shot export choice; keep is the default for old projects too. */
+export function keepShotSourceAudio(shot: Shot, project?: { pipelineMode?: string; speechWorkflow?: { mode?: string } | null } | null, keepAmbient = true): boolean {
+  if (isDigitalHumanSpeechProject(project)) return true
+  const mode = effectiveShotAudioMode(shot)
+  if (mode === 'tts') return shot.ttsSourceAudioMode !== 'mute'
+  return project?.pipelineMode === 'smart-speech' || mode === 'h3-dialogue' || mode === 'h3-voiceover' || keepAmbient
+}
+
 export function h3VoiceMode(shot: Shot): 'dialogue' | 'voiceover' | 'none' {
   const mode = effectiveShotAudioMode(shot)
   if (mode === 'h3-dialogue') return 'dialogue'
@@ -41,10 +49,10 @@ export function h3VoiceMode(shot: Shot): 'dialogue' | 'voiceover' | 'none' {
   return 'none'
 }
 
-/** 说话者不在画面里时，即使标成对白也按画外音处理，避免把被叫的人当成开口者。 */
+/** 显式选择优先；只有未选择人声方案的旧镜头才推断画外音。 */
 export function resolveH3VoiceMode(shot: Shot, onScreenNames: string[] = []): 'dialogue' | 'voiceover' | 'none' {
   const mode = h3VoiceMode(shot)
-  if (mode !== 'dialogue') return mode
+  if (mode !== 'dialogue' || shot.audioMode === 'h3-dialogue') return mode
   const speaker = (shot.voiceover || '').match(/^([^：:\n]{1,12})[：:]/)?.[1]?.trim()
   if (!speaker) return mode
   const onScreen = onScreenNames.some((name) => name === speaker || speaker.includes(name) || name.includes(speaker))

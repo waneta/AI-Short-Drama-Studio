@@ -1,6 +1,7 @@
 /** 智能体和画布之间的轻量桥：聚焦节点、拉近镜头、同步生成进度。 */
 
-type RevealFn = (nodeId?: string) => void
+export type CanvasRevealOptions = { preserveZoom?: boolean }
+type RevealFn = (nodeId?: string, options?: CanvasRevealOptions) => void
 type InspectFn = (nodeId: string) => void
 type SelectFn = (nodeId: string) => void
 
@@ -12,8 +13,8 @@ export function setCanvasReveal(fn: RevealFn | null) {
   revealFn = fn
 }
 
-export function revealCanvas(nodeId?: string) {
-  revealFn?.(nodeId)
+export function revealCanvas(nodeId?: string, options?: CanvasRevealOptions) {
+  revealFn?.(nodeId, options)
 }
 
 export function setCanvasInspect(fn: InspectFn | null) {

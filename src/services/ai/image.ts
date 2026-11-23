@@ -1,3 +1,6 @@
+import { isSeedream5ImageModel, seedream5OutputSize } from './seedream5ImageSize'
+import { imageModelCapabilities, imageFixedSize, seedreamRequestSize } from './imageModelCapabilities'
+import { gptImageOutputSize } from './gptImageSize'
 import { wan27ImageResolution, wan27ImageSizeIssue } from './wan27ImageSize'
 import { generationRecord } from './generationRecord'
 import type { GenerationRecord } from '@/types'
@@ -21,6 +24,7 @@ import { resolveImageReferenceMentions } from './imageReferenceMentions'
 import { comfyImageSeed } from './comfyImageSeed'
 import { generateMockImage } from './mock'
 import {
+  providerHttp,
   httpCustomImageGenerate,
   comfyPromptGenerate,
   resolveImageAdapter
@@ -46,6 +50,7 @@ export interface ImageGenInput {
   h3Resolution?: H3ImageResolution
   h3CustomWidth?: number
   h3CustomHeight?: number
+  quality?: string
   n?: number
   /** 原生Comfy图片默认随机；显式提供可复现同一结果。 */
   seed?: number
@@ -74,7 +79,7 @@ function imageConfig(input: ImageGenInput) {
   return { ...cfg, model: input.model?.trim() || cfg.model }
 }
 
-async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> {
+async function realCustomOrComfy(input: ImageGenInput, onProgress?: (msg: string) => void): Promise<ImageGenOutput> {
   const cfg = imageConfig(input)
   const adapterType = resolveImageAdapter(cfg)
   const prompt = withGptImageQuality(buildPrompt(input, Boolean(input.referenceImages?.length)), cfg.model)
@@ -136,7 +141,10 @@ async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> 
       height: size.height,
       adapter,
       signal: input.signal,
-      kind: 'image'
+      kind: 'image',
+      // Multi-reference H3 loads two language/vision encoders and may exceed the generic six-minute budget.
+      generationTimeoutMs: actual === 'MiniMax H3 Image' ? 20 * 60_000 : undefined,
+      onProgress
     })
     return { blob, mimeType, prompt: input.prompt, generation: generation as GenerationRecord }
   }
@@ -144,7 +152,7 @@ async function realCustomOrComfy(input: ImageGenInput): Promise<ImageGenOutput> 
 }
 
 function isSeedreamModel(model: string): boolean {
-  return /^seedream-/i.test(model)
+  return /^seedream-/i.test(model) || isSeedream5ImageModel(model)
 }
 
 function isGptImageModel(model: string): boolean {
@@ -294,17 +302,16 @@ function pickLegacySize(ar?: AspectRatio, w?: number, h?: number): string {
 }
 
 /** GPT Image always returns base64 and uses different sizes from the legacy Images API. */
-function imageApiParameters(model: string, input: ImageGenInput): { size: string; response_format?: 'b64_json' } {
+function imageApiParameters(model: string, input: ImageGenInput): { size: string; response_format?: 'b64_json'; quality?: string } {
   const gptImage = /^(gpt[-_]image(?:[-_]|$)|chatgpt-image-latest$)/i.test(model.trim())
   if (!gptImage) {
     return { size: pickLegacySize(input.aspectRatio, input.width, input.height), response_format: 'b64_json' }
   }
 
-  // These standard sizes work across GPT Image versions, including models without custom sizes.
-  const [width, height] = input.aspectRatio
-    ? input.aspectRatio.split(':').map(Number)
-    : [input.width, input.height]
-  return { size: width === height ? '1024x1024' : width > height ? '1536x1024' : '1024x1536' }
+  // generateImage resolves and validates the model's exact dimensions before recording or sending.
+  const capability = imageModelCapabilities(imageConfig(input), model)
+  return { size: `${input.width}x${input.height}`,
+    ...(input.quality && capability.qualities.includes(input.quality) ? { quality: input.quality } : {}) }
 }
 
 function blobToDataUri(blob: Blob): Promise<string> {
@@ -362,10 +369,12 @@ async function realSeedream(input: ImageGenInput): Promise<ImageGenOutput> {
     throw new Error('[image] 未配置 VITE_IMAGE_BASE_URL / VITE_IMAGE_API_KEY')
   }
 
-  const refs = (input.referenceImages ?? []).slice(0, 10)
+  const modern = isSeedream5ImageModel(model)
+  if (modern && (input.referenceImages?.length || 0) > 10) throw new Error('[image] Seedream 5.0 最多支持10张参考图，本次未提交。')
+  const refs = modern ? (input.referenceImages ?? []) : (input.referenceImages ?? []).slice(0, 10)
   const withRefs = refs.length > 0
   const fullPrompt = buildPrompt(input, withRefs)
-  const size = pickSeedreamSize(input.aspectRatio, input.width, input.height)
+  const size = modern ? `${input.width}x${input.height}` : pickSeedreamSize(input.aspectRatio, input.width, input.height)
 
   const body: Record<string, unknown> = {
     model,
@@ -381,20 +390,21 @@ async function realSeedream(input: ImageGenInput): Promise<ImageGenOutput> {
       images.push(await blobToChatImageDataUri(blob))
     }
     body.image = images
-    body.sequential_image_generation = 'disabled'
+    if (!modern) body.sequential_image_generation = 'disabled'
     log(`→ Seedream 多图融合 ${images.length} 张参考 · ${model} · ${size}`)
   } else {
     log(`→ Seedream 文生图 · ${model} · ${size}`)
   }
 
-  const resp = await fetch(`${baseUrl}/images/generations`, {
+  const resp = await providerHttp(`${baseUrl.trim().replace(/\/+$/, '')}/images/generations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify(body),
-    signal: input.signal
+    signal: input.signal,
+    timeoutMs: 180_000
   })
 
   if (!resp.ok) {
@@ -455,6 +465,7 @@ async function realLegacyEdit(input: ImageGenInput): Promise<ImageGenOutput> {
   form.append('prompt', fullPrompt)
   const parameters = imageApiParameters(model, input)
   form.append('size', parameters.size)
+  if (parameters.quality) form.append('quality', parameters.quality)
   if (parameters.response_format) form.append('response_format', parameters.response_format)
 
   const refs = input.referenceImages.slice(0, 4)
@@ -585,7 +596,7 @@ async function runImageGeneration(
     const adapterType = resolveImageAdapter(cfg)
     if (isDashScopeEndpoint(cfg) && !cfg.adapter?.type) {
       onProgress?.('百炼千问生图...')
-      return await dashscopeImage(cfg, { ...input, prompt: buildPrompt(input, Boolean(input.referenceImages?.length)) })
+      return await dashscopeImage(cfg, { ...input, prompt: buildPrompt(input, Boolean(input.referenceImages?.length)) }, onProgress)
     }
     if (adapterType === 'zealman-workflow') {
       onProgress?.('Zealman 出图...')
@@ -604,6 +615,7 @@ async function runImageGeneration(
         model: cfg.model,
         prompt,
         aspectRatio: input.aspectRatio,
+        resolution: input.h3Resolution === '1mp' ? '1k' : input.h3Resolution === '16mp' ? '4k' : '2k',
         n: input.n,
         referenceImages: input.referenceImages,
         signal: input.signal,
@@ -613,7 +625,7 @@ async function runImageGeneration(
     }
     if (adapterType === 'comfyui-prompt' || adapterType === 'comfyui-workflow') {
       onProgress?.('ComfyUI 出图...')
-      return await realCustomOrComfy(input)
+      return await realCustomOrComfy(input, onProgress)
     }
     if (isSeedreamModel(model)) {
       onProgress?.(
@@ -714,7 +726,14 @@ export async function generateImage(input: ImageGenInput, onProgress?: (msg: str
     }
   }
   let size = { width: input.width, height: input.height }
-  if (resolution && resolution !== 'auto') {
+  const capability = imageModelCapabilities(cfg, input.model || cfg.model)
+  if (capability.seedream5) {
+    size = seedream5OutputSize(resolution, input.aspectRatio || `${input.width}:${input.height}`,
+      { width: input.h3CustomWidth, height: input.h3CustomHeight })
+  } else if (capability.mode === 'gpt') {
+    size = gptImageOutputSize(input.model || cfg.model, input.aspectRatio || `${input.width}:${input.height}`,
+      resolution === 'custom' ? { width: input.h3CustomWidth, height: input.h3CustomHeight } : undefined)
+  } else if (resolution && resolution !== 'auto') {
     const ratio = input.aspectRatio?.split(':').map(Number)
     size = h3ImageOutputSize(resolution, ratio?.[0] || input.width, ratio?.[1] || input.height, input.h3CustomWidth, input.h3CustomHeight)
   }
@@ -722,9 +741,14 @@ export async function generateImage(input: ImageGenInput, onProgress?: (msg: str
     const issue = wan27ImageSizeIssue(cfg.model, size.width, size.height, input.referenceImages?.length)
     if (issue) throw new Error(issue)
   }
-  const request = { ...input, ...size, h3Resolution: resolution, imageProfileId: cfg.id, model: input.model || cfg.model }
+  if (capability.mode === 'seedream' && !capability.seedream5) size = seedreamRequestSize(size.width, size.height)
+  const fixedSize = imageFixedSize(cfg, input.model || cfg.model, input.aspectRatio || `${size.width}:${size.height}`)
+  if (fixedSize && capability.mode !== 'gpt') size = fixedSize
+  const quality = imageModelCapabilities(cfg, input.model || cfg.model).qualities.includes(input.quality || '') ? input.quality : undefined
+  const request = { ...input, quality, ...size, h3Resolution: resolution, imageProfileId: cfg.id, model: input.model || cfg.model }
   resolvedImageConfigs.set(request, cfg)
   const record = generationRecord('image', cfg, request)
+  record.simulated = getAIMode() === 'mock'
   record.model = actual || request.model || cfg.model
   try {
     const result = await runImageGeneration(request, onProgress)

@@ -10,12 +10,15 @@
  */
 
 import type { CanvasGraph, H3VideoGenMode } from './canvas'
+import type { AssetOrganization } from './assetOrganization'
 
 export type ID = string
 
 export type AgentAutonomy = 'assist' | 'gated' | 'autopilot'
 
 export interface AgentChatMessage {
+  engine?: 'api' | 'codex'
+  model?: string
   id: ID
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -23,6 +26,8 @@ export interface AgentChatMessage {
 }
 
 export interface AgentTaskRecord {
+  engine?: 'api' | 'codex'
+  model?: string
   id: ID
   request: string
   status: 'planned' | 'running' | 'success' | 'failed' | 'cancelled'
@@ -46,6 +51,19 @@ export interface AgentWorkspaceState {
   tasks: AgentTaskRecord[]
   /** 单次自动任务最多允许的外部生成调用数，0 表示不额外限制 */
   callBudget: number
+  /** Active transcript stays in messages for compatibility with the agent runner. */
+  activeConversationId?: ID
+  conversations?: AgentConversation[]
+}
+
+export interface AgentConversation {
+  id: ID
+  title: string
+  /** User title takes precedence over the automatic first-message title. */
+  customTitle?: string
+  messages: AgentChatMessage[]
+  createdAt: number
+  updatedAt: number
 }
 
 /** 画面风格 */
@@ -60,7 +78,7 @@ export type VisualStyle =
   | 'ink-wash'
 
 /** 视频宽高比 */
-export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:3' | '21:9'
+export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:3' | '21:9' | '1:2' | '2:1' | '3:4' | '3:2' | '2:3' | '5:4' | '4:5' | '9:21'
 
 /** 单个分镜 */
 export interface Shot {
@@ -82,6 +100,8 @@ export interface Shot {
   voiceover: string
   /** H3 内生对白/画外音、后期 TTS，或完全无口播 */
   audioMode?: ShotAudioMode
+  /** 后期TTS导出时保留视频原声或静音；缺省保留，不修改源文件。 */
+  ttsSourceAudioMode?: 'keep' | 'mute'
   /** H3 说话人音色与表达方式，例如“年轻女声 / 温柔自然” */
   speakerHint?: string
   /**
@@ -478,6 +498,8 @@ export interface Scene {
 
 /** 完整项目 */
 export interface Project {
+  /** Asset folders, tags and favorites are saved with this project. */
+  assetOrganization?: AssetOrganization
   id: ID
   name: string
   script: Script | null

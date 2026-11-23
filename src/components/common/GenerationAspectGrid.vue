@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ASPECT_PRESETS } from '@/utils/aspect'
 import type { AspectRatio } from '@/types'
-defineProps<{ modelValue: AspectRatio; disabled?: boolean; fixed?: boolean }>()
-defineEmits<{ 'update:modelValue': [value: AspectRatio] }>()
+defineProps<{ modelValue: AspectRatio; disabled?: boolean; fixed?: boolean; ratios?: AspectRatio[]; allowAuto?: boolean; autoSelected?: boolean }>()
+defineEmits<{ 'update:modelValue': [value: AspectRatio]; selectAuto: [] }>()
 const box = (value: string) => {
   const [w, h] = value.split(':').map(Number)
   return { width: `${22 * w / Math.max(w, h)}px`, height: `${22 * h / Math.max(w, h)}px` }
@@ -12,8 +12,12 @@ const box = (value: string) => {
   <div class="settings-section">
     <div class="settings-label">比例 <span v-if="fixed">设计板固定横版</span></div>
     <div class="aspect-options">
-      <button v-for="item in ASPECT_PRESETS" :key="item.value" class="settings-option aspect-option" type="button"
-        :class="{ on: modelValue === item.value }" :aria-label="`比例 ${item.value}`" :aria-pressed="modelValue === item.value"
+      <button v-if="allowAuto" class="settings-option aspect-option" type="button" :class="{ on: autoSelected }"
+        aria-label="比例 自适应" :aria-pressed="!!autoSelected" :disabled="disabled || fixed" @click="$emit('selectAuto')">
+        <span class="aspect-icon-wrap"><i style="width:18px;height:14px;border-style:dashed" /></span><span>自适应</span>
+      </button>
+      <button v-for="item in (ratios ? ratios.map(value => ({ value })) : ASPECT_PRESETS)" :key="item.value" class="settings-option aspect-option" type="button"
+        :class="{ on: !autoSelected && modelValue === item.value }" :aria-label="`比例 ${item.value}`" :aria-pressed="!autoSelected && modelValue === item.value"
         :disabled="disabled || fixed" @click="$emit('update:modelValue', item.value)">
         <span class="aspect-icon-wrap"><i :style="box(item.value)" /></span><span>{{ item.value }}</span>
       </button>

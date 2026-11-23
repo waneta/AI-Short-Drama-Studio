@@ -93,11 +93,11 @@ export function detectDialogueLanguage(text: string): string {
   return 'English'
 }
 
-/** 台词/旁白只允许进这个标签；中文原词固定 [Chinese]。 */
+/** 台词/旁白原词进入标签，语言按实际内容确定。 */
 export function h3SpokenTag(spoken: string): string {
-  const line = sanitizeDialogue(spoken)
+  const line = sanitizeDialogue(spoken, true)
   if (!line) return ''
-  return `<d>[Chinese] ${line}</d>`
+  return `<d>[${detectDialogueLanguage(line)}] ${line}</d>`
 }
 
 export function isOfficialH3Prompt(text: string): boolean {
@@ -144,7 +144,7 @@ export function isMessyH3Prompt(text: string): boolean {
  */
 function stripAllowedCjk(text: string): string {
   return String(text || '')
-    .replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '')
+    .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
     .replace(/图\s*\d+\s*[是：:=]*/g, '')
     .replace(/「[^」]{1,24}」/g, '')
     .replace(/人物声音[^\n]*(?:\r?\n(?!\r?\n)[^\n]*)*/g, '')
@@ -162,7 +162,7 @@ export function stripCjkOutsideSpokenTags(text: string): string {
     return `__H3KEEP${held.length - 1}__`
   }
   const masked = String(text || '')
-    .replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, mask)
+    .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, mask)
     .replace(/图\s*\d+\s*[是：:=]*/g, mask)
     .replace(/「[^」]{1,24}」/g, mask)
     // 音色是中文：整块护住，否则会被下面的汉字清理删成空壳
@@ -188,16 +188,16 @@ function looksLikeSpokenDialogue(text: string): boolean {
   return /[\u3400-\u9fff]/.test(line)
 }
 
-function sanitizeDialogue(text: string): string {
+function sanitizeDialogue(text: string, trusted = false): string {
   const line = stripSpokenStageDirection(
-    normalizeForSpeech(spokenTextOnly(text))
+    normalizeForSpeech(spokenTextOnly(trusted ? text.replace(/^[A-Za-z][A-Za-z .'-]{0,40}[：:]\s*/, '') : text))
       .replace(/<\/?d>/gi, '')
       .replace(/\[[^\]]{0,120}\]/g, '')
   )
     .replace(/\s+/g, ' ')
     .trim()
   if (!line || isPlaceholderSpokenLine(line) || looksLikeShotDirection(line)) return ''
-  if (!looksLikeSpokenDialogue(line)) return ''
+  if (!trusted && !looksLikeSpokenDialogue(line)) return ''
   return line
 }
 
@@ -205,11 +205,11 @@ function sanitizeDialogue(text: string): string {
 export function sanitizeDTagContents(text: string): string {
   return String(text || '')
     .replace(/<d>\s*(\[[^\]]*\])?\s*([\s\S]*?)<\/d>/gi, (_, bracket, inner) => {
-      const line = sanitizeDialogue(inner)
+      const line = sanitizeDialogue(inner, true)
       if (!line) return ''
       const meta = String(bracket || '').trim()
-      if (/^\[Chinese\b/i.test(meta) && /,/.test(meta)) return `<d>${meta} ${line}</d>`
-      return `<d>[Chinese] ${line}</d>`
+      if (/^\[(?:Chinese|English|Japanese|Korean)\b/i.test(meta) && /,/.test(meta)) return `<d>${meta} ${line}</d>`
+      return `<d>[${detectDialogueLanguage(line)}] ${line}</d>`
     })
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
@@ -220,7 +220,7 @@ export function sanitizeDTagContents(text: string): string {
 export function spokenCueLines(voiceover: string): string[] {
   return String(voiceover || '')
     .split(/\r?\n/)
-    .map((line) => sanitizeDialogue(line))
+    .map((line) => sanitizeDialogue(line, true))
     .filter((line) => line && !isPlaceholderSpokenLine(line) && !looksLikeShotDirection(line))
 }
 
@@ -560,39 +560,36 @@ function closedMouthLock(input: H3PromptInput): string {
     .map((slot) => `<Subject ${slot.subject}>`)
   if (!people.length) {
     const names = onScreenEnglish(input)
-    if (!names.length) return 'Every on-screen person keeps the mouth completely closed.'
-    return `${names.join(' and ')} keep the mouth completely closed and only react. They are not speaking.`
+    if (!names.length) return 'Every on-screen person avoids speaking lip movements; story actions such as eating remain natural.'
+    return `${names.join(' and ')} do not mouth the narration. Story actions such as eating remain natural; they are not speaking.`
   }
-  return `${people.join(' and ')} keep the mouth completely closed and only react. They are not speaking.`
+  return `${people.join(' and ')} do not mouth the narration. Story actions such as eating remain natural; they are not speaking.`
 }
 
 function dialogueBlocks(input: H3PromptInput, lines: string[]): string {
-  if (!lines.length || input.voiceMode === 'none') return 'No dialogue. No lips moving.'
-  const who = speakerSubjectLabel(input)
+  if (!lines.length || input.voiceMode === 'none') return 'No dialogue. No speaking lip movements.'
   const voiceTag = String(input.speakerVoice || '').trim().replace(/[；;]+$/, '')
   if (input.voiceMode === 'voiceover') {
     const spoken = lines
       .map(
         (line, i) =>
-          `${who} (S${i + 1})${voiceTag ? `, voice: ${voiceTag}` : ''} says in an off-screen voiceover: ${h3SpokenTag(line)}`
+          `Off-screen narrator (S${i + 1})${voiceTag ? `, voice: ${voiceTag}` : ''} says in an off-screen voiceover: ${h3SpokenTag(line)}`
       )
       .join(' ')
-    return `${spoken} while lips remain completely closed. ${closedMouthLock(input)} The words inside the d tag are being called from off-screen; nobody on screen mouths them.`
+    return `${spoken} without any on-screen speaking lip movements. ${closedMouthLock(input)} The words inside the d tag are being called from off-screen; nobody on screen mouths them.`
   }
   const hint = englishOrOmit(input.speakerHint?.replace(/^\[|\]$/g, ''))
+  const speakerIds = new Map<string, number>()
   // 角色音色是中文，台词本身也是中文，所以不走 englishOrOmit，直接跟在说话人后面。
   return lines
     .map((line, i) => {
-      const id = `S${i + 1}`
+      const source = String(input.voiceover || '').split(/\r?\n/).filter(line => spokenCueLines(line).length)[i] || ''
+      const name = source.match(/^([^：:\n]{1,24})[：:]/)?.[1]?.trim()
+      const who = speakerSubjectLabel({ ...input, speakerName: name || input.speakerName })
+      if (!speakerIds.has(who)) speakerIds.set(who, speakerIds.size + 1)
+      const id = `S${who.match(/<Subject (\d+)>/)?.[1] || speakerIds.get(who)}`
       const extra = [voiceTag ? `voice: ${voiceTag}` : '', hint].filter(Boolean).join(', ')
-      const lead =
-        i === 0 && extra
-          ? `${who} (${id}), ${extra},`
-          : i === 0
-            ? `${who} (${id})`
-            : extra
-              ? `(${id}, same voice)`
-              : `(${id})`
+      const lead = `${who} (${id})${i === 0 && extra ? `, ${extra},` : ''}`
       return `${lead} says: ${h3SpokenTag(line)}`
     })
     .join(' ')
@@ -600,9 +597,9 @@ function dialogueBlocks(input: H3PromptInput, lines: string[]): string {
 
 function stripDialogueMentions(text: string): string {
   return text
-    .replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '')
+    .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
     .replace(/[^.]{0,120}\(S1\)[\s\S]{0,260}?(?:says in an off-screen voiceover|says):[\s\S]*?(?:closed\.|silently\.)/gi, '')
-    .replace(/No dialogue\.?\s*(No lips moving\.?)?/gi, '')
+    .replace(/No dialogue\.?\s*(No (?:speaking lip movements|lips moving)\.?)?/gi, '')
     .replace(/On-screen lips remain completely closed\.?/gi, '')
     .replace(/while (?:his|her|their) lips remain completely closed\.?/gi, '')
     .replace(/Every on-screen person keeps the mouth completely closed\.?/gi, '')
@@ -637,7 +634,7 @@ function stripSpokenLeaks(text: string, spoken: string): string {
 
 function stripSpokenLeaksOutsideTags(text: string, voiceover: string): string {
   const held: string[] = []
-  const masked = text.replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, (block) => {
+  const masked = text.replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, (block) => {
     held.push(block)
     return `__H3D${held.length - 1}__`
   })
@@ -765,11 +762,11 @@ function ensureOfficialBody(desc: string, input: H3PromptInput): string {
 }
 
 function ensureSpokenTags(text: string, lines: string[]): string {
-  if (!lines.length) return sanitizeDTagContents(text.replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '').trim())
+  if (!lines.length) return sanitizeDTagContents(text.replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '').trim())
   const tags = lines.map((line) => h3SpokenTag(line)).filter(Boolean)
-  if (!tags.length) return sanitizeDTagContents(text.replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '').trim())
+  if (!tags.length) return sanitizeDTagContents(text.replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '').trim())
   const existing = [...text.matchAll(/<d>\s*(\[[^\]]*\])?\s*([\s\S]*?)<\/d>/gi)]
-  const taggedText = existing.map((m) => sanitizeDialogue(m[2] || ''))
+  const taggedText = existing.map((m) => sanitizeDialogue(m[2] || '', true))
   const exactMatch =
     taggedText.length === lines.length &&
     lines.every((line, i) => taggedText[i] === line)
@@ -777,7 +774,7 @@ function ensureSpokenTags(text: string, lines: string[]): string {
     return sanitizeDTagContents(text)
   }
   // 与可信台词不一致时：清空旧 <d>，再按可信列表重写，避免场记残留
-  let cleaned = text.replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, '').trim()
+  let cleaned = text.replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '').trim()
   const extra = tags.join('\n\n')
   if (/\[\d{2}:\d{2}\.\d{3}\s*[–-]/i.test(cleaned)) {
     // 插到第一个时间轴段落后
@@ -849,10 +846,10 @@ function spokenLinesForPrompt(input: H3PromptInput): string[] {
   // 不是对白，不能再从整包场记中二次抽取。
   if (input.voiceMode === 'none') return []
   const fromVo = spokenCueLines(input.voiceover || '')
-  if (fromVo.length) return [...new Set(fromVo)]
+  if (fromVo.length) return fromVo
   const fromNotes = extractSpokenFromNotes(
     String(input.prompt || '')
-      .replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, '')
+      .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
       .replace(/【(?:节点当前提示词|本镜场记|分镜字段|口播栏)[^】]*】/g, '')
   )
   const merged: string[] = []
@@ -874,6 +871,37 @@ function isStructuredShotBody(text: string): boolean {
   )
 }
 
+/** Normalize model-generated placement without changing the trusted words or scene actions. */
+function applySpeechPlacement(body: string, input: H3PromptInput, wanted: string[]): string {
+  if (!wanted.length || input.voiceMode === 'none') return body
+  const offscreen = input.voiceMode === 'voiceover'
+  let text = body
+    .replace(/No dialogue\.?\s*(No (?:speaking lip movements|lips moving)\.?)?/gi, '')
+    .replace(/(?:while )?(?:his|her|their|all|on-screen)?\s*lips remain completely closed\.?/gi, '')
+    .replace(/Every on-screen person keeps the mouth completely closed\.?/gi, '')
+  // Remove opposing placement cues from action prose; tags are rebuilt below.
+  text = offscreen
+    ? text.replace(/says(?: in an off-screen voiceover)?\s*:/gi, 'is heard in off-screen voiceover:')
+        .replace(/(?:accurate |natural )?lip[- ]sync(?:hronization)?/gi, 'no speaking lip movements')
+    : text.replace(/says in an off-screen voiceover|is heard in off-screen voiceover/gi, 'says on screen')
+        .replace(/(?:nobody|no one) on screen mouths them\.?/gi, '')
+  const sources = String(input.voiceover || '').split(/\r?\n/).filter(line => spokenCueLines(line).length)
+  let index = 0
+  text = text.replace(/<d>\s*(\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, (_, meta) => {
+    const line = wanted[index]
+    const name = sources[index++]?.match(/^([^：:\n]{1,24})[：:]/)?.[1]?.trim()
+    const speaker = englishSpeaker({ ...input, speakerName: name || input.speakerName }, 'the on-screen speaker')
+    const placement = offscreen ? 'off-screen voiceover, no on-screen speaking lip movements' : `spoken on screen by ${speaker}, natural lip synchronization`
+    const delivery = String(meta || '').slice(1, -1).split(/,\s*/).filter(item => item && !/^(Chinese|English|Japanese|Korean)$/i.test(item) && !/spoken on screen|off-screen|voiceover|lip|speaking lip/i.test(item)).join(', ')
+    const voice = input.speakerVoice?.trim() && (!name || !input.speakerName || name === input.speakerName) ? `voice: ${input.speakerVoice.trim()}` : ''
+    const extra = [delivery, voice && !delivery.includes(voice) ? voice : ''].filter(Boolean).join(', ')
+    return line ? `<d>[${detectDialogueLanguage(line)}, ${placement}${extra ? `, ${extra}` : ''}] ${line}</d>` : ''
+  })
+  return `${text.trim()}\n\n${offscreen
+    ? 'Off-screen voiceover only. Visible characters do not mouth the narration; preserve story actions such as eating and all scene ambience.'
+    : 'Only the named on-screen speaker mouths each line in turn; listeners do not speak. No off-screen narration. Preserve scene ambience.'}`
+}
+
 function applyDialogue(desc: string, input: H3PromptInput): string {
   // 可信台词：口播栏 / 引号 / 「台词：」。没有就强制无对白，丢掉模型胡写的 <d>。
   const wanted = spokenLinesForPrompt(input)
@@ -883,12 +911,12 @@ function applyDialogue(desc: string, input: H3PromptInput): string {
     else {
       body = sanitizeDTagContents(
         body
-          .replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, '')
-          .replace(/\bNo dialogue\.?\s*(No lips moving\.?)?/gi, '')
+          .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
+          .replace(/\bNo dialogue\.?\s*(No (?:speaking lip movements|lips moving)\.?)?/gi, '')
       )
-      if (!/no dialogue/i.test(body)) body = `${body}\n\nNo dialogue. No lips moving.`.trim()
+      if (!/no dialogue/i.test(body)) body = `${body}\n\nNo dialogue. No speaking lip movements.`.trim()
     }
-    return body
+    return applySpeechPlacement(body, input, wanted)
   }
   const shaped = ensureOfficialBody(desc, input)
   const match = shaped.match(/^([\s\S]*?)(\[Shot\s*1\][\s\S]*)$/i)
@@ -898,25 +926,25 @@ function applyDialogue(desc: string, input: H3PromptInput): string {
     if (!hasTags) {
       const cleaned = stripDialogueMentions(stripSpokenLeaks(body, wanted.join('\n')))
       const next = /no dialogue/i.test(cleaned)
-        ? cleaned.replace(/no dialogue\.?\s*(no lips moving\.?)?/i, dialogueBlocks(input, wanted))
+        ? cleaned.replace(/no dialogue\.?\s*(no speaking lip movements\.?)?/i, dialogueBlocks(input, wanted))
         : `${cleaned} ${dialogueBlocks(input, wanted)}`.trim()
       body = next
     } else {
       body = stripSpokenLeaksOutsideTags(body, wanted.join('\n'))
     }
     body = ensureSpokenTags(body, wanted)
-    body = body.replace(/No dialogue\.?\s*(No lips moving\.?)?/gi, '').trim()
+    body = body.replace(/No dialogue\.?\s*(No (?:speaking lip movements|lips moving)\.?)?/gi, '').trim()
   } else {
     const cleaned = stripDialogueMentions(stripSpokenLeaks(body, ''))
-      .replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '')
+      .replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
       .replace(/[^.]{0,80}\(S\d+\)[^.]{0,60}says(?: in an off-screen voiceover)?:\s*/gi, '')
       .trim()
-    body = /no dialogue/i.test(cleaned) ? cleaned : `${cleaned} No dialogue. No lips moving.`.trim()
+    body = /no dialogue/i.test(cleaned) ? cleaned : `${cleaned} No dialogue. No speaking lip movements.`.trim()
   }
   if (!/finishes naturally within/i.test(body)) {
     body = `${body} ${finishLine(input)}`
   }
-  return `[Shot 1] ${sanitizeDTagContents(body)}`
+  return applySpeechPlacement(`[Shot 1] ${sanitizeDTagContents(body)}`, input, wanted)
 }
 
 function defaultSoundscape(input: H3PromptInput, spoken: string): string {
@@ -930,9 +958,19 @@ function defaultSoundscape(input: H3PromptInput, spoken: string): string {
     ? `${english.replace(/\.?$/, '')} stay synchronized with the picture.`
     : 'Diegetic ambience and physical action sounds stay synchronized with the picture: room tone, cloth, footsteps, and handled objects.'
   if (!spoken || input.voiceMode === 'none') {
-    return `${base} No voices, no lips moving, no music.`
+    return `${base} No voices, no speaking lip movements, no music.`
   }
   return `${base} Spoken words appear only inside the d tag. No music.`
+}
+
+/** Do not keep an LLM soundscape that contradicts the selected speech placement. */
+function speechSoundscape(input: H3PromptInput, sound: string, spoken: string): string {
+  const safe = sound && !/dialogue|narrat|voice|spoken|speech|lips?|talk|singing|对白|旁白|口播|人声|说话/i.test(sound)
+    ? sound.trim() : defaultSoundscape(input, spoken)
+  const control = !spoken || input.voiceMode === 'none' ? 'No voices. Preserve scene ambience and action sound effects.'
+    : input.voiceMode === 'voiceover' ? 'Only off-screen narration speaks the tagged words; no on-screen speaking lip movements. Preserve scene ambience.'
+    : 'Only the named on-screen speakers deliver the tagged words in turn, with synchronized lips; no off-screen narration. Preserve scene ambience.'
+  return `${safe} ${control}`
 }
 
 function subjectPhrase(slot: LabeledSlot): string {
@@ -1245,7 +1283,7 @@ export function validateH3Prompt(prompt: string, expectedDialogue?: string): H3P
     if (tagged.some((line) => !wanted.some((e) => e === line))) {
       issues.push('d 标签里出现了不该朗读的内容')
     }
-    const outsideTags = prompt.replace(/<d>\s*\[[^\]]+\]\s*[\s\S]*?<\/d>/gi, '')
+    const outsideTags = prompt.replace(/<d>\s*(?:\[[^\]]*\])?\s*[\s\S]*?<\/d>/gi, '')
     if (wanted.some((line) => line.length >= 4 && outsideTags.includes(line))) {
       issues.push('台词原文在 d 标签外重复出现')
     }
@@ -1274,7 +1312,7 @@ export function composeH3VideoPrompt(input: H3PromptInput): string {
         source,
       resolved
     )
-    const sound = extractField(source, 'overall_soundscape') || defaultSoundscape(resolved, spoken)
+    const sound = speechSoundscape(resolved, extractField(source, 'overall_soundscape'), spoken)
     const music = extractField(source, 'non_diegetic_music') || 'N/A'
     return assembleOfficial(desc, sound, music, resolved)
   }
@@ -1284,13 +1322,13 @@ export function composeH3VideoPrompt(input: H3PromptInput): string {
       extractField(source, 'integrated_multimodal_description') || source,
       resolved
     )
-    const sound = extractField(source, 'overall_soundscape') || defaultSoundscape(resolved, spoken)
+    const sound = speechSoundscape(resolved, extractField(source, 'overall_soundscape'), spoken)
     const music = extractField(source, 'non_diegetic_music') || 'N/A'
     return assembleOfficial(desc, sound, music, resolved)
   }
 
   const desc = applyDialogue(descriptionFromNotes(resolved), resolved)
-  return assembleOfficial(desc, defaultSoundscape(resolved, spoken), 'N/A', resolved)
+  return assembleOfficial(desc, speechSoundscape(resolved, '', spoken), 'N/A', resolved)
 }
 
 function stripJsonFence(text: string): string {
@@ -1404,7 +1442,7 @@ Never omit 图1/图2/图3 when those pictures exist. These images are identity/l
 
 6) Treat each reference character according to the state described in the scene: living body, carved statue, portrait, reflection, shadow, off-screen voice, hidden presence, or absent identity reference. A character reference does NOT prove that a full living person is physically present. Do not duplicate a referenced identity as both a person and a prop unless the action explicitly shows a transformation.
 
-7) Dialogue ONLY inside <d>. Dialogue is a sequence of mutually exclusive speaking turns. For two or more lines, build a concise but cinematic chronological timeline. Each time range must contain: (a) framing or one motivated camera move, (b) the active character's concrete body action, eyeline and readable facial change, (c) the listening character's position and nonverbal reaction, and (d) the line when present. Use this form when someone speaks on screen:
+7) Dialogue ONLY inside <d>. Dialogue is a sequence of mutually exclusive speaking turns. For two or more lines, build a concise but cinematic chronological timeline. Each time range must contain: (a) framing or one motivated camera move, (b) the active character's concrete body action, eyeline and readable facial change, (c) the listening character's position and nonverbal reaction, and (d) the line when present. Obey the selected Voice mode. For voiceover, all words are off-screen narration and visible people do not mouth them (story actions such as eating remain natural). For none, omit all spoken tags. Use this form ONLY for on-screen dialogue:
 <d>[Chinese, spoken on screen by EnglishName, delivery and accurate lip synchronization] 原词</d>
 Delivery stays in the bracket. The tag contains ONLY the words a mouth actually says. Never dump 场记, timestamps, style, 图1, Camera language, or performance notes into <d>.
 Immediately before EVERY d tag, name exactly one speaker with a stable (S#) and a speech verb. Give each speaker a non-overlapping time range and keep the listener's reaction short and physical. Never use a bare d tag. Do not repeat long lip-lock warnings after every line; one concise instruction that only the named speaker talks in each range is enough. Do not reject or split a clip merely because its dialogue is fast when the user's timing explicitly fits it.
@@ -1425,7 +1463,7 @@ Rules:
 - Write direct, decisive filmmaking prose like a director describing the finished moving image. The format is a container, not a prose template.
 - English for action, camera, light, performance. Chinese is allowed ONLY (1) inside <d> for spoken words, and (2) 图N plus 「source names」 in the picture roster.
 - In action prose, use stable romanized names plus (S1), (S2), etc. Keep the same S-number throughout. Do not anonymize a known character as “the man.”
-- Spoken lines already extracted below are the ONLY dialogue. If the list is empty, write No dialogue. No lips moving. NEVER invent speech from 场记, timestamps, style, or picture roster. Never put 无 or director notes inside a d tag.
+- Spoken lines already extracted below are the ONLY dialogue. If the list is empty, write No dialogue. No speaking lip movements. NEVER invent speech from 场记, timestamps, style, or picture roster. Never put 无 or director notes inside a d tag.
 - MUST COPY the picture roster block below verbatim at the start of integrated_multimodal_description. Do not invent, omit, or reorder 图1/图2/图3.
 - Do not write subject_definitions, summary, retention_analysis.
 - Do not show grids, four-view sheets, storyboards, collage, captions, subtitles, or labels on screen.
@@ -1448,7 +1486,7 @@ ${pictureRoster(resolved) || 'no extra pictures'}
 Voice mode: ${cueLines.length ? resolved.voiceMode || 'dialogue' : 'none — no trusted spoken lines; do NOT invent dialogue'}
 Character voice (this speaker's own timbre, kept verbatim as delivery inside each <d> bracket; do not reinterpret or translate it away): ${resolved.speakerVoice || '(not set — infer a natural timbre that fits the character)'}
 Spoken lines already extracted (quotes / 台词 / 口播栏 only; director notes are NOT speech):
-${cueLines.length ? cueLines.map((line, i) => `${i + 1}. ${line}`).join('\n') : '(none — write No dialogue. No lips moving.)'}
+${cueLines.length ? cueLines.map((line, i) => `${i + 1}. ${line}`).join('\n') : '(none — write No dialogue. No speaking lip movements.)'}
 Dialogue ownership recovered from the source (each item is one exclusive turn; preserve this order):
 ${dialogueCues.length ? dialogueCues.map((cue, i) => `${i + 1}. speaker=${cue.speaker || 'infer from the immediately surrounding action; never leave unassigned'} | words=${cue.text}`).join('\n') : '(none)'}
 Sound notes: ${englishOrOmit(resolved.audioDescription) || '(from the node text)'}
@@ -1498,7 +1536,7 @@ Rebuild the prompt as a concise cinematic timeline, not a four-line outline and 
 ${pictureRoster(resolved) || 'no extra pictures'}
 
 Trusted dialogue:
-${cueLines.length ? cueLines.join('\n') : '(none; no dialogue and no lips moving)'}
+${cueLines.length ? cueLines.join('\n') : '(none; no dialogue and no speaking lip movements)'}
 
 Required dialogue ownership and order:
 ${dialogueCues.length ? dialogueCues.map((cue, i) => `${i + 1}. speaker=${cue.speaker || 'infer from source context'} | words=${cue.text}`).join('\n') : '(none)'}
@@ -1537,13 +1575,13 @@ ${desc || '(empty)'}`
           ? 'dialogue'
           : resolved.voiceMode || 'dialogue'
         : 'none',
-      voiceover: trusted.length ? trusted.join('\n') : ''
+      voiceover: trusted.length ? resolved.voiceover || trusted.join('\n') : ''
     }
     const shaped = applyDialogue(desc, resolvedWithSpeech)
     const spoken = trusted.join(' ')
     const assembled = assembleOfficial(
       shaped,
-      sound || defaultSoundscape(resolvedWithSpeech, spoken),
+      speechSoundscape(resolvedWithSpeech, sound, spoken),
       'N/A',
       resolvedWithSpeech
     )

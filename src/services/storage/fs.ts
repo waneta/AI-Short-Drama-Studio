@@ -226,3 +226,12 @@ export async function assetAbsPathInDir(
   if (!(await desktop().exists(abs))) return undefined
   return abs
 }
+
+/** Read another project's metadata without mutating activeDir or assetCache. */
+export async function listAssetMetadataInDir(dir: string): Promise<Asset[]> {
+  const api = desktop(), file = await manifestPath(dir)
+  if (!(await api.exists(file))) return []
+  const value = JSON.parse(await api.readText(file))
+  if (!Array.isArray(value)) throw new Error('素材清单格式无效')
+  return value as Asset[]
+}

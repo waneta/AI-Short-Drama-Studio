@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { Handle, Position, useVueFlow } from '@vue-flow/core'
 import { useAssetsStore, useLibraryStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
 import { runCanvasNode, optimizeShotVideoPrompt, regenerateShotFrame, grabVideoLastFrameNode } from '@/services/canvas/runner'
-import { isNodeRunning, nodeJobStartedAt } from '@/services/canvas/jobs'
+import { isNodeRunning, nodeJobStartedAt, canCancelNodeJob, cancelNodeJob, isNodeCancelling } from '@/services/canvas/jobs'
 import { needsPlayReview } from '@/services/canvas/playGate'
 import { cssAspectRatio } from '@/services/canvas/layout'
 import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
@@ -19,6 +19,9 @@ import ParamSelect from '@/components/common/ParamSelect.vue'
 import ImageModelSelect from '@/components/settings/ImageModelSelect.vue'
 import { comfyImageModelOption } from '@/services/ai/comfyImageWorkflow'
 import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
+import VideoGenerationModeSelect from '@/components/settings/VideoGenerationModeSelect.vue'
+import AutoDlVideoInputs from '@/components/canvas/AutoDlVideoInputs.vue'
+import { autodlWorkflowForProfile } from '@/services/ai/autodl'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import AspectRatioSeg from '@/components/common/AspectRatioSeg.vue'
@@ -335,6 +338,8 @@ const lastFrameId = computed({
   }
 })
 const isH3VideoNode = computed(() => type.value === 'shotVideo' && videoModel.value !== 'wan-prime')
+const autodlWorkflow = computed(() => { const id = nodeMeta.value?.data.videoProfileId; return autodlWorkflowForProfile(id ? settings.config.videos.find(p => p.id === id) : settings.config.video) })
+const isAutodlAudioSync = computed(() => autodlWorkflow.value?.mode === 'audio-sync')
 const isH3Fl2va = computed(() => isH3VideoNode.value && h3GenMode.value === 'fl2va')
 const videoStillHint = computed(() => {
   if (type.value !== 'shotVideo') return ''
@@ -1132,6 +1137,8 @@ const cropStyle = computed(() => ({
         v-if="generating || toolBusy"
         :label="toolBusy || '生成中'"
         :started-at="generating && (isImageNode || isFrameNode || isVideoNode) ? nodeJobStartedAt(props.id) : undefined"
+        :cancelable="isVideoNode && generating && canCancelNodeJob(props.id)"
+        :cancelling="isNodeCancelling(props.id)" @cancel="cancelNodeJob(props.id)"
       />
       <div v-if="status === 'failed' && nodeMeta?.error && !selected" class="fail-dot" :title="nodeMeta.error" />
 
@@ -1285,6 +1292,7 @@ const cropStyle = computed(() => ({
           @input="endFramePromptValue = ($event.target as HTMLTextAreaElement).value"
         />
       </div>
+      <AutoDlVideoInputs v-else-if="type === 'shotVideo' && isAutodlAudioSync" :node-id="props.id" :disabled="generating" />
       <VideoReferenceEditor v-else-if="type === 'shotVideo' && !isH3Fl2va" :node-id="props.id" v-model="promptValue" :disabled="generating || optimizingPrompt" />
       <textarea
         v-else
@@ -1293,7 +1301,7 @@ const cropStyle = computed(() => ({
         :placeholder="promptHint"
         @input="promptValue = ($event.target as HTMLTextAreaElement).value"
       />
-      <H3GenModeSelect v-if="isH3VideoNode" v-model="h3GenMode" />
+      <H3GenModeSelect v-if="isH3VideoNode && !autodlWorkflow" v-model="h3GenMode" />
       <FramePairSlots
         v-if="isH3Fl2va"
         v-model:first-id="firstFrameId"
@@ -1321,6 +1329,7 @@ const cropStyle = computed(() => ({
         />
         <span v-if="type === 'shotVideo' && videoStillHint" class="still-hint">{{ videoStillHint }}</span>
         <span v-else>{{ metaLine }}</span>
+        <VideoGenerationModeSelect v-if="type === 'shotVideo' && autodlWorkflow" :node-id="props.id" />
         <NativeH3VideoControls v-if="type === 'shotVideo'" :node-id="props.id" />
         <button
           v-if="genLabel"
@@ -1945,12 +1954,19 @@ const cropStyle = computed(() => ({
   transform: translateX(-50%);
   transform-origin: 50% 0;
   overflow: visible;
-  background: var(--color-bg-1);
-  border: 1px solid var(--color-border);
+  background: linear-gradient(155deg, rgba(126, 180, 255, 0.04), transparent 55%), var(--color-node-editor);
+  border: 1px solid var(--color-node-editor-border);
   border-radius: 12px;
   padding: 10px 12px;
-  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), var(--shadow-node-editor);
 }
+.prompt:focus-within {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(126, 180, 255, 0.14), var(--shadow-node-editor);
+}
+.prompt textarea::placeholder { color: var(--color-text-3); opacity: 1; }
+.prompt:not(.is-expanded) .prompt-foot { border-top: 1px solid rgba(255, 255, 255, 0.09); padding-top: 8px; }
+
 .prompt textarea {
   width: 100%;
   min-height: 88px;

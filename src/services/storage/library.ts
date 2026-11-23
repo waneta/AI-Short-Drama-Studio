@@ -1,5 +1,5 @@
 /**
- * 公共资产库：跨项目共享图片和音频
+ * 公共资产库：跨项目共享图片、视频和音频
  * 桌面端：用户所选保存目录/_library/
  * 浏览器：IndexedDB assets（library: true）
  */
@@ -20,6 +20,7 @@ function toPlain<T>(value: T): T {
 function extOf(asset: Pick<Asset, 'kind' | 'mimeType' | 'filename'>): string {
   const fromName = asset.filename?.split('.').pop()?.toLowerCase()
   if (fromName && fromName.length <= 5) return fromName
+  if (asset.kind === 'video') return /webm/.test(asset.mimeType) ? 'webm' : /quicktime/.test(asset.mimeType) ? 'mov' : 'mp4'
   if (asset.kind === 'audio') {
     if (/wav/.test(asset.mimeType)) return 'wav'
     if (/mpeg/.test(asset.mimeType)) return 'mp3'
@@ -42,6 +43,7 @@ async function libraryDir(): Promise<string> {
 async function ensureLibraryDirs(dir: string) {
   await desktop().writeText(await desktop().join(dir, 'assets', 'images', '.keep'), '')
   await desktop().writeText(await desktop().join(dir, 'assets', 'audio', '.keep'), '')
+  await desktop().writeText(await desktop().join(dir, 'assets', 'videos', '.keep'), '')
   await desktop().writeText(await desktop().join(dir, 'thumbs', '.keep'), '')
 }
 
@@ -80,7 +82,7 @@ export async function saveLibraryAsset(asset: Asset, blob: Blob, thumbBlob?: Blo
   const dir = await libraryDir()
   await ensureLibraryDirs(dir)
   const ext = extOf(stored)
-  const rel = `assets/${stored.kind === 'audio' ? 'audio' : 'images'}/${stored.id}.${ext}`
+  const rel = `assets/${stored.kind === 'audio' ? 'audio' : stored.kind === 'video' ? 'videos' : 'images'}/${stored.id}.${ext}`
   const abs = await desktop().join(dir, rel)
   await desktop().writeBuffer(abs, await bufferFromBlob(blob))
   stored.fileRelPath = rel
@@ -176,7 +178,7 @@ export async function saveLibraryFolders(folders: LibraryFolder[]): Promise<void
 /** 更新公共库素材元数据（分类文件夹等），不改二进制文件 */
 export async function updateLibraryAssetMeta(
   id: string,
-  patch: { folderId?: string | null; filename?: string }
+  patch: { folderId?: string | null; filename?: string; tags?: string[] }
 ): Promise<Asset | undefined> {
   const folderId =
     patch.folderId === null || patch.folderId === '' ? undefined : patch.folderId
@@ -187,6 +189,7 @@ export async function updateLibraryAssetMeta(
     const { blob, ...meta } = data
     const next = { ...(meta as Asset) }
     if (patch.filename) next.filename = patch.filename
+    if (patch.tags) next.tags = [...new Set(patch.tags.map(t => t.trim()).filter(Boolean))]
     if ('folderId' in patch) {
       if (folderId === undefined) delete next.folderId
       else next.folderId = folderId
@@ -201,6 +204,7 @@ export async function updateLibraryAssetMeta(
   if (idx < 0) return undefined
   const next = { ...list[idx] }
   if (patch.filename) next.filename = patch.filename
+  if (patch.tags) next.tags = [...new Set(patch.tags.map(t => t.trim()).filter(Boolean))]
   if ('folderId' in patch) {
     if (folderId === undefined) delete next.folderId
     else next.folderId = folderId

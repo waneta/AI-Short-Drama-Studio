@@ -1,3 +1,7 @@
+import { autodlWorkflowForProfile, autodlVideoResolution } from '@/services/ai/autodl'
+import { shotSpeechPolicy, speechPolicyIssue } from '@/services/ai/videoSpeechPolicy'
+import { optimizeImagePrompt } from '@/services/ai/promptAssistance'
+import { videoNodeCapabilities, videoNodeMode, videoNodeDuration, videoNodeInputIssue, videoNodeReferenceIds, videoBatchCount } from '@/services/ai/videoNodeCapabilities'
 import {
   useProjectStore,
   useAssetsStore,
@@ -59,10 +63,11 @@ import {
   pushHistory,
   resolveH3VoiceMode
 } from '@/utils/shot'
+import { imageBatchCount, imageModelCapabilities } from '@/services/ai/imageModelCapabilities'
 import { rebuildCanvasGraph, absoluteCanvasPosition, nextFreeformPosition, NODE_W } from './layout'
 import { emitCanvasActivity, revealCanvas, selectCanvasNode } from './canvasBridge'
 import { extractStageLabel, extractStageNoun, nextExtractStage, type ExtractStage } from './pipeline'
-import { friendlyAiError } from '@/services/ai/abort'
+import { friendlyAiError, isAbortError, isTimeoutAbort } from '@/services/ai/abort'
 import { lookFromScript, lookFromTexts, styleLabel, inferVisualStyleFromText } from '@/utils/visualStyle'
 import { aspectToSize } from '@/utils/aspect'
 import {
@@ -84,7 +89,7 @@ import { generateFinalCut } from './exportFinal'
 import { setActiveProjectDir } from '@/services/storage'
 import { toDigitalHumanWav, extractVideoLastFrame } from '@/services/ffmpeg'
 import { referenceAudioIds, videoReferenceBindings } from './videoReferences'
-import { compileVideoReferenceTokens } from '@/services/ai/videoReferenceTokens'
+import { bindLegacyVideoReferences, compileVideoReferenceTokens } from '@/services/ai/videoReferenceTokens'
 import type { AspectRatio, CanvasNode, ID, Project, Scene, Shot, Subject, VideoGenModel, VideoResolution } from '@/types'
 import {
   isH3VideoFamily,
@@ -110,7 +115,7 @@ function imageSettingsForNode(node?: CanvasNode) {
   const settings = useSettingsStore().config
   const profile = node?.data.imageProfileId ? settings.images.find(p => p.id === node.data.imageProfileId) : settings.image
   return { ...h3ImageNodeInput(node?.data), h3Resolution: nodeImageResolution(node?.data, profile),
-    imageProfileId: node?.data.imageProfileId, model: node?.data.imageModel || profile?.model, seed: node?.data.generationSeed }
+    imageProfileId: node?.data.imageProfileId, model: node?.data.imageModel || profile?.model, seed: imageModelCapabilities(profile, node?.data.imageModel || profile?.model).seed ? node?.data.generationSeed : undefined, quality: node?.data.imageQuality }
 }
 
 export type RunProgress = (nodeId: string, msg: string) => void
@@ -1025,6 +1030,8 @@ function canvasVideoModelForShot(shot: Shot): VideoGenModel {
 
 function canvasVideoResolutionForShot(shot: Shot, videoModel: VideoGenModel): VideoResolution {
   const node = canvasVideoNodeForShot(shot)
+  const workflow = autodlWorkflowForProfile(getVideoConfig(node?.data.videoProfileId || shot.videoProfileId))
+  if (workflow) return autodlVideoResolution(node?.data.videoResolution, workflow)
   if (videoModel === 'h3' && isNativeH3VideoProfile(getVideoConfig(node?.data.videoProfileId || shot.videoProfileId))) {
     return normalizeNativeH3Resolution(node?.data.videoResolution)
   }
@@ -1119,7 +1126,7 @@ function sortNodeIdsByShotIndex(p: Project, ids: string[]): string[] {
 /** 这张图还被别处用着吗？决定「重截尾帧」时旧图能不能顺手清掉。 */
 function assetStillInUse(p: Project, assetId: ID): boolean {
   for (const n of p.canvas?.nodes ?? []) {
-    if (n.data.outputAssetId === assetId) return true
+    if (n.data.outputAssetId === assetId || (n.data.outputAssetIds ?? []).includes(assetId)) return true
     if ((n.data.referenceAssetIds ?? []).includes(assetId)) return true
     if (n.data.firstFrameAssetId === assetId || n.data.lastFrameAssetId === assetId) return true
   }
@@ -1151,22 +1158,29 @@ export async function grabVideoLastFrameNode(
   if (!p?.canvas) throw new Error('画布还没有准备好')
   const node = p.canvas.nodes.find((n) => n.id === nodeId)
   if (!node) throw new Error('找不到这个视频节点')
+  if (!['videoGen', 'shotVideo', 'final', 'export'].includes(node.type)) throw new Error('请选择视频节点截取尾帧')
   const shot = node.data.shotId ? p.shots.find((s) => s.id === node.data.shotId) : undefined
-  const videoId =
-    node.type === 'final' || node.type === 'export' ? p.finalVideoAssetId : shot?.videoAssetId
+  const videoId = node.type === 'videoGen' ? node.data.outputAssetId
+    : node.type === 'final' || node.type === 'export' ? p.finalVideoAssetId : shot?.videoAssetId
   if (!videoId) throw new Error('这个节点还没有视频，先生成视频再截取尾帧')
-  const blob = await assets.getBlob(videoId)
+  const blob = (await assets.getBlob(videoId)) || (await useLibraryStore().getBlob(videoId))
   if (!blob) throw new Error('视频读取失败')
   onProgress?.('截取最后一帧…')
   const frame = await extractVideoLastFrame(blob)
+  const assertSourcePresent = () => {
+    if (project.current !== p || !p.canvas?.nodes.includes(node)) throw new Error('项目或视频节点已变更，请重新截取尾帧')
+  }
+  assertSourcePresent()
   const asset = await assets.add(frame, 'image', 'extracted', {
     filename: `lastframe_${shot ? `shot${shot.index + 1}_` : ''}${Date.now().toString(36)}`,
     projectId: p.id,
     shotId: shot?.id
   })
 
+  assertSourcePresent()
   const frameNodeId = `lastFrame:${node.id}`
-  const label = shot ? `第 ${shot.index + 1} 镜 · 尾帧` : '成片尾帧'
+  const label = node.type === 'videoGen' ? `${node.data.label || '视频'} · 尾帧`
+    : shot ? `第 ${shot.index + 1} 镜 · 尾帧` : '成片尾帧'
   const existing = p.canvas.nodes.find((n) => n.id === frameNodeId)
   if (existing) {
     const old = existing.data.outputAssetId
@@ -1196,7 +1210,7 @@ export async function grabVideoLastFrameNode(
           prompt: '',
           referenceAssetIds: [],
           referenceSourceNodeIds: [],
-          aspectRatio: p.settings.aspectRatio,
+          aspectRatio: node.data.aspectRatio || p.settings.aspectRatio,
           outputAssetId: asset.id
         },
         status: 'success'
@@ -1218,7 +1232,7 @@ export async function grabVideoLastFrameNode(
   }
   await project.save()
   selectCanvasNode(frameNodeId)
-  revealCanvas(frameNodeId)
+  revealCanvas(frameNodeId, { preserveZoom: true })
   onProgress?.('尾帧已放进视频旁边的图片节点')
   return frameNodeId
 }
@@ -1241,7 +1255,15 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
   const project = useProjectStore()
   const assets = useAssetsStore()
   if (!project.current) throw new Error('没有打开的项目')
-  if (!(shot.compiledVideoPrompt || '').trim()) {
+  const syncProfile = getVideoConfig(canvasVideoNodeForShot(shot)?.data.videoProfileId || shot.videoProfileId)
+  const audioSyncWorkflow = autodlWorkflowForProfile(syncProfile)?.mode === 'audio-sync'
+  const speechPolicy = shotSpeechPolicy(shot, project.current, audioSyncWorkflow)
+  const speechIssue = speechPolicyIssue(speechPolicy, isNativeH3VideoProfile(syncProfile) && canvasVideoNodeForShot(shot)?.data.videoAudioEnabled === false)
+  if (speechIssue) throw new Error(speechIssue)
+  const requestSpeech = speechPolicy ? { shotAudioMode: speechPolicy.mode,
+    voiceover: speechPolicy.speech || '', voiceMode: speechPolicy.mode === 'h3-dialogue' ? 'dialogue' as const : speechPolicy.mode === 'h3-voiceover' ? 'voiceover' as const : 'none' as const,
+    suppressSpeech: speechPolicy.mode === 'tts' } : {}
+  if (!audioSyncWorkflow && !(shot.compiledVideoPrompt || '').trim()) {
     throw new Error('图生视频提示词为空。请自己填写，或主动点击“优化提示词 / 按分镜重铺”；系统不会自动回填。')
   }
   const aspectRatio = shotNodeAspect(project.current, shot.id, 'shotVideo')
@@ -1255,9 +1277,29 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
   }
   const boundProfile = canvasVideoNodeForShot(shot)?.data.videoProfileId || shot.videoProfileId
   if (boundProfile) shot = { ...shot, videoProfileId: boundProfile }
-  const audioInput = await videoReferenceAudioInput(canvasVideoNodeForShot(shot))
+  const audioInput = autodlWorkflowForProfile(syncProfile)?.mode === 'fl2va' ? {} : await videoReferenceAudioInput(canvasVideoNodeForShot(shot))
   const videoModel = canvasVideoModelForShot(shot)
   const cloudConfig = getVideoConfig(canvasVideoProfileForShot(shot))
+  if (audioSyncWorkflow) {
+    const node = canvasVideoNodeForShot(shot)
+    if (referenceAudioIds(node?.data).length !== 1 || !audioInput.referenceAudioBlob) throw new Error('数字人口播需要且仅支持一段驱动音频')
+    const frameId = node?.data.firstFrameAssetId || shot.firstFrameAssetId || shot.imageAssetId
+    const imageBlob = frameId ? await tryLoadRefImageBlob(frameId) : undefined
+    if (!imageBlob) throw new Error('数字人口播需要一张可读取的人物图片')
+    const result = await generateVideo({
+      audioSync: true, audioBlob: audioInput.referenceAudioBlob, referenceAudio: audioInput.referenceAudio, referenceAudios: audioInput.referenceAudios,
+      imageBlob, prompt: '数字人口播（上传音频驱动）', promptAsIs: true, videoGenerationMode: 'audio-sync',
+      duration: shot.duration, width: videoSize.width, height: videoSize.height, aspectRatio,
+      videoModel, videoProfileId: canvasVideoProfileForShot(shot), videoResolution: canvasVideoResolutionForShot(shot, videoModel),
+      ...requestSpeech, signal, resumeTaskId: shot.videoTaskId,
+      onTaskSubmitted: async taskId => { project.updateShot(shot.id, { videoTaskId: taskId }); await project.save() }
+    }, onProgress)
+    const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
+    if (!quality.passed) throw new Error(`视频文件无效：${quality.issues.join('；')}`)
+    const asset = await assets.add(result.blob, 'video', 'ai-generated', { generation: result.generation, filename: `video_${shot.index + 1}_${Date.now().toString(36)}`, prompt: result.prompt, projectId: project.current.id, shotId: shot.id })
+    project.assignShotVideo(shot.id, asset.id); project.updateShot(shot.id, { videoTaskId: undefined, duration: result.duration }); await project.save()
+    return asset
+  }
   if (videoModel !== 'wan-prime' && videoModel !== 'h3-v5' && isDashScopeEndpoint(cloudConfig) && !cloudConfig.adapter?.type) {
     if (shot.h3GenMode === 'fl2va' || project.current.settings.h3ShotChainMode === 'fl2va') throw new Error('百炼单张首帧接入请关闭 H3 首尾帧链模式')
     const frameId = shot.firstFrameAssetId || shot.imageAssetId
@@ -1267,8 +1309,9 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
       ...audioInput,
       referenceBindings: videoReferenceBindings(frameId ? [frameId] : [], referenceAudioIds(canvasVideoNodeForShot(shot)?.data), canvasVideoNodeForShot(shot)?.data.videoReferenceOrder),
       imageBlob: imageBlob || undefined, prompt: shot.compiledVideoPrompt!, promptAsIs: true,
-      duration: shot.duration, width: videoSize.width, height: videoSize.height, aspectRatio,
-      videoModel, videoProfileId: canvasVideoProfileForShot(shot), videoResolution: canvasVideoResolutionForShot(shot, videoModel), signal, resumeTaskId: shot.videoTaskId,
+      duration: shot.duration, width: videoSize.width, height: videoSize.height,
+      aspectRatio, videoAspectAuto: canvasVideoNodeForShot(shot)?.data.videoAspectAuto,
+      videoModel, videoProfileId: canvasVideoProfileForShot(shot), videoResolution: canvasVideoResolutionForShot(shot, videoModel), ...requestSpeech, signal, resumeTaskId: shot.videoTaskId,
       onTaskSubmitted: async (taskId) => { project.updateShot(shot.id, { videoTaskId: taskId }); await project.save() }
     }, onProgress)
     const quality = await reviewVideoQuality(result.blob, result.prompt, signal)
@@ -1284,6 +1327,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
     return asset
   }
   const chainFl2va =
+    (!autodlWorkflowForProfile(cloudConfig) || autodlWorkflowForProfile(cloudConfig)?.mode === 'fl2va') &&
     videoModel !== 'wan-prime' &&
     (project.current.settings.h3ShotChainMode || 'auto') === 'fl2va'
   const perShotFl2va = shotUsesFl2va(shot, videoModel)
@@ -1393,7 +1437,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
           videoAudioEnabled: canvasVideoNodeForShot(shot)?.data.videoAudioEnabled,
           h3GenMode: 'fl2va',
           mode: 'I2VA',
-          signal,
+          ...requestSpeech, signal,
           resumeTaskId: shot.videoTaskId,
           onTaskSubmitted: async (taskId) => {
             project.updateShot(shot.id, { videoTaskId: taskId })
@@ -1425,7 +1469,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
 
   const stillMode = stillModeForShot(shot, project.current)
   const allEntries = collectShotVideoEntries(shot, project.current)
-  let packed = packVideoRefEntries(allEntries)
+  let packed = packVideoRefEntries(allEntries, 9, canvasVideoNodeForShot(shot)?.data.videoReferenceOrder)
   if (chainFirstBlob) {
     // 把上一镜末帧固化成一张参考图并排在最前，常规出片也从它起手
     try {
@@ -1558,7 +1602,7 @@ export async function generateShotVideo(shot: Shot, onProgress?: (msg: string) =
       videoAudioEnabled: canvasVideoNodeForShot(shot)?.data.videoAudioEnabled,
       h3GenMode: 'reference',
       mode: h3Mode,
-      signal,
+      ...requestSpeech, signal,
       resumeTaskId: shot.videoTaskId,
       onTaskSubmitted: async (taskId) => {
         project.updateShot(shot.id, { videoTaskId: taskId })
@@ -1614,7 +1658,7 @@ export async function optimizeShotVideoPrompt(shot: Shot, signal?: AbortSignal):
   const p = project.current
   const aspectRatio = shotNodeAspect(p, shot.id, 'shotVideo')
   const videoSize = aspectToSize(aspectRatio)
-  const packed = packVideoRefEntries(collectShotVideoEntries(shot, p))
+  const packed = packVideoRefEntries(collectShotVideoEntries(shot, p), 9, canvasVideoNodeForShot(shot)?.data.videoReferenceOrder)
   const imageSlots = buildH3ImageSlots(packed)
   const cast = subjectsForShot(shot, p)
   const scene = sceneForShot(shot, p)
@@ -1632,24 +1676,11 @@ export async function optimizeShotVideoPrompt(shot: Shot, signal?: AbortSignal):
   ]
     .filter(Boolean)
     .join('\n\n')
-  // 台词只从口播栏 + 场记里的引号/「台词：」抠；绝不从旧编译稿的 <d> 或场记正文回收
-  const speechSource = [
-    shot.voiceover || '',
-    performance.replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, ''),
-    // 旧稿里的引号对白可以保留，但去掉整段场记式中文
-    usableNodeText
-      .replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, '')
-      .replace(/Reference pictures[\s\S]*?(?=\[Shot\s*\d+\]|Camera language|$)/i, '')
-  ]
-    .filter(Boolean)
-    .join('\n')
-  const cueLines = [...extractSpokenFromNotes(speechSource), ...spokenCueLines(shot.voiceover || '')].filter(
-    (line, i, all) => line && all.indexOf(line) === i
-  )
-  const hasSpeech = cueLines.length > 0
-  const silent = !hasSpeech
-  const resolvedVoice = resolveH3VoiceMode(shot, onScreenNames)
-  const voiceMode = silent ? 'none' : resolvedVoice === 'voiceover' ? 'voiceover' : 'dialogue'
+  const policy = shotSpeechPolicy(shot, p)
+  const issue = speechPolicyIssue(policy)
+  if (issue) throw new Error(issue)
+  const voiceMode = policy?.mode === 'h3-dialogue' ? 'dialogue' : policy?.mode === 'h3-voiceover' ? 'voiceover' : 'none'
+  const trustedVoiceover = voiceMode === 'none' ? '' : policy?.speech || ''
   const visibleSpeaker = (shot.voiceover || '').match(/^([^：:\n]{1,12})[：:]/)?.[1]?.trim()
   const castNotes = cast
     .map((item, i) => {
@@ -1664,7 +1695,7 @@ export async function optimizeShotVideoPrompt(shot: Shot, signal?: AbortSignal):
       .join('\n\n'),
     aesthetic: p.script?.h3Aesthetic || p.script?.aesthetic,
     audioDescription: shot.audioDescription,
-    voiceover: cueLines.length ? cueLines.join('\n') : '',
+    voiceover: trustedVoiceover,
     voiceMode,
     speakerHint: shot.speakerHint,
     speakerVoice: resolveShotSpeakerVoice(shot, project.current),
@@ -2540,27 +2571,67 @@ export async function generateFreeformImage(
   const look = lookFromScript(p.script)
   const aspectRatio = canvasNodeAspect(node, p.settings.aspectRatio)
   const size = imageGenSize('shot', aspectRatio)
-  onProgress?.('正在出图...')
-  const result = await generateImage({
-    prompt,
-    style: look.style,
-    ...imageSettingsForNode(node),
-    width: size.width,
-    height: size.height,
-    aspectRatio,
-    referenceImages: blobs.length ? blobs : undefined,
-    signal
-  })
-  const asset = await assets.add(result.blob, 'image', 'ai-generated', {
-    generation: result.generation,
-    filename: `${node.data.label || '图片'}.png`,
-    prompt,
-    projectId: p.id
-  })
-  await saveGeneratedImageToSharedLibrary(result.blob, '其他', asset.filename, prompt, onProgress)
-  project.patchCanvasNode(nodeId, { outputAssetId: asset.id })
+  // Snapshot this batch: node edits must not change the remaining submissions.
+  const settings = { ...imageSettingsForNode(node) }
+  const count = imageBatchCount(node.data.imageCount)
+  const label = node.data.label || '图片'
+  const outputs: string[] = []
+  let lastAsset: Awaited<ReturnType<typeof assets.add>> | undefined
+  for (let index = 0; index < count; index++) {
+    ensureNotCancelled(signal)
+    if (project.current?.id !== p.id) throw new Error('已切换项目，停止后续图片生成。')
+    if (!p.canvas?.nodes.some(n => n.id === nodeId)) throw new Error('图片节点已删除，停止后续生成。')
+    onProgress?.(count > 1 ? `正在生成第${index + 1}/${count}张…` : '正在出图...')
+    const result = await generateImage({
+      prompt, style: look.style, ...settings,
+      seed: settings.seed == null ? undefined : settings.seed + index,
+      width: size.width, height: size.height, aspectRatio,
+      referenceImages: blobs.length ? blobs : undefined, n: 1, signal
+    })
+    const asset = await assets.add(result.blob, 'image', 'ai-generated', {
+      generation: result.generation, filename: `${label}${count > 1 ? `-${index + 1}` : ''}.png`, prompt, projectId: p.id
+    })
+    outputs.push(asset.id)
+    // Save every completed result before continuing; partial batches survive later failures.
+    const source = p.canvas?.nodes.find(n => n.id === nodeId)
+    const patch = { outputAssetId: outputs[0], outputAssetIds: [...outputs] }
+    if (project.current?.id === p.id) { project.patchCanvasNode(nodeId, patch); await project.save() }
+    else if (source) { source.data = { ...source.data, ...patch }; p.updatedAt = Date.now() }
+    if (project.current?.id !== p.id) { const { saveProject } = await import('@/services/storage/idb'); await saveProject(p) }
+    await saveGeneratedImageToSharedLibrary(result.blob, '其他', asset.filename, prompt, onProgress)
+    lastAsset = asset
+  }
+  return lastAsset!
+
+}
+
+/** Optimize a still-image prompt without changing references, settings or submitting generation. */
+export async function optimizeFreeformImagePrompt(nodeId: string, signal?: AbortSignal) {
+  ensureNotCancelled(signal)
+  const project = useProjectStore()
+  const p = project.current
+  const node = p?.canvas?.nodes.find(item => item.id === nodeId)
+  if (!p || !node || node.type !== 'imageGen') throw new Error('找不到图片节点')
+  const prompt = node.data.prompt || ''
+  if (!prompt.trim()) throw new Error('请先写提示词')
+  const contextFor = (target: CanvasNode) => {
+    const ids = resolvedCanvasReferenceAssetIds(p, target)
+    const slots = canvasReferenceSlotEntries(p, target)
+    return {
+      model: imageSettingsForNode(target).model || '当前图片模型',
+      aspectRatio: canvasNodeAspect(target, p.settings.aspectRatio),
+      references: ids.map((_id, index) => ({ number: index + 1, label: slots[index]?.name || `参考图${index + 1}` }))
+    }
+  }
+  const stateFor = (target: CanvasNode) => JSON.stringify([target.data, resolvedCanvasReferenceAssetIds(p, target), contextFor(target)])
+  const before = stateFor(node)
+  const result = await optimizeImagePrompt(prompt, contextFor(node), signal)
+  ensureNotCancelled(signal)
+  const latest = project.current?.canvas?.nodes.find(item => item.id === nodeId)
+  if (project.current?.id !== p.id || !latest || stateFor(latest) !== before) throw new Error('节点内容、模型、画幅或参考图已变化，请重新优化；未覆盖当前提示词。')
+  project.setCanvasNodePrompt(nodeId, result)
   await project.save()
-  return asset
+  return result
 }
 
 export async function generateFreeformVideo(
@@ -2576,91 +2647,84 @@ export async function generateFreeformVideo(
   const node = p.canvas?.nodes.find((n) => n.id === nodeId)
   if (!node) throw new Error('找不到节点')
   const prompt = node.data.prompt ?? ''
-  if (!prompt.trim()) throw new Error('请先写提示词')
-  const audioInput = await videoReferenceAudioInput(node)
-  const ids = resolvedCanvasReferenceAssetIds(p, node)
-  const videoModel = normalizeVideoGenModel(node.data.videoModel)
-  const useFl2va = isH3VideoFamily(videoModel) && normalizeH3GenMode(node.data.h3GenMode) === 'fl2va'
-  if (!useFl2va && ids.length > videoMaxRefImages(videoModel)) {
-    throw new Error(`当前视频模型最多支持 ${videoMaxRefImages(videoModel)} 张参考图，请减少参考图；不会自动丢弃多余图片。`)
-  }
-  const firstId = node.data.firstFrameAssetId || ids[0]
-  const lastId = node.data.lastFrameAssetId || ids[1]
-  if (useFl2va) {
-    if (!firstId) throw new Error('请先选首帧')
-    if (!lastId) throw new Error('请先选尾帧')
-  } else if (!ids.length && !audioInput.referenceAudioBlob) {
-    throw new Error('请先选至少一张参考图')
-  }
-  onProgress?.(useFl2va ? '读取首帧和尾帧...' : '读取参考图...')
-  const library = useLibraryStore()
+  // Snapshot mode, parameters and selected references for the entire batch.
+  const data = { ...node.data }
+  const profile = getVideoConfig(data.videoProfileId)
+  const caps = videoNodeCapabilities(data, profile)
+  if (!caps.audioSync && !prompt.trim()) throw new Error('请先写提示词')
+  const mode = videoNodeMode(data, caps)
+  const allIds = resolvedCanvasReferenceAssetIds(p, node)
+  const allAudioIds = referenceAudioIds(data)
+  const issue = videoNodeInputIssue(data, caps, allIds, allAudioIds)
+  if (issue) throw new Error(issue)
+  const audioIds = mode === 'omni' || caps.audioSync ? allAudioIds : []
+  const audioMeta = mode === 'omni' || caps.audioSync ? await videoReferenceAudioInput(node) : {}
+  const audioInput = caps.audioSync ? { audioSync: true, audioBlob: audioMeta.referenceAudioBlob, referenceAudio: audioMeta.referenceAudio, referenceAudios: audioMeta.referenceAudios } : audioMeta
+  const videoModel = normalizeVideoGenModel(data.videoModel)
+  const useFl2va = mode === 'first-last'
+  const selectedRefs = videoNodeReferenceIds(data, caps, allIds, allAudioIds)
+  const ids = selectedRefs.images
+  const bindings = videoReferenceBindings(ids, audioIds, useFl2va || mode === 'image' ? [] : data.videoReferenceOrder)
+  const visibleBindings = mode === 'reference' || mode === 'omni' ? videoReferenceBindings(allIds, allAudioIds, data.videoReferenceOrder) : bindings
+  const submittedPrompt = caps.audioSync ? '数字人口播（上传音频驱动）' : bindLegacyVideoReferences(prompt, visibleBindings)
+  if (!caps.audioSync) compileVideoReferenceTokens(submittedPrompt, bindings, caps.nativeReferences)
+  onProgress?.(useFl2va ? '读取首帧和尾帧...' : '读取参考素材...')
   const blobs: Blob[] = []
-  if (useFl2va) {
-    blobs.push(await loadRefImageBlob(firstId, '首帧'))
-    blobs.push(await loadRefImageBlob(lastId, '尾帧'))
-  } else {
-    for (const [index, id] of ids.entries()) {
-      const b = (await assets.getBlob(id)) || (await library.getBlob(id))
-      if (!b) throw new Error(`参考图 @${index + 1} 无法读取，请重新上传或选择这张图片；后续参考图不会自动前移。`)
-      blobs.push(b)
-    }
+  const library = useLibraryStore()
+  for (const [index, id] of ids.entries()) {
+    const blob = (await assets.getBlob(id)) || (await library.getBlob(id))
+    if (!blob) throw new Error(`参考图 @${index + 1} 无法读取，请重新上传或选择这张图片；后续参考图不会自动前移。`)
+    blobs.push(blob)
   }
   if (p.folderPath) setActiveProjectDir(p.folderPath)
-  const duration = clampVideoDuration(node.data.duration, videoModel, 8)
+  const duration = videoNodeDuration(data.duration, caps)
   const aspectRatio = canvasNodeAspect(node, p.settings.aspectRatio)
   const videoSize = aspectToSize(aspectRatio)
-  const slotEntries = canvasReferenceSlotEntries(p, node)
-  const imageSlots = buildH3ImageSlots(
-    slotEntries.length
-      ? slotEntries
-      : blobs.map((_, i) => ({ kind: 'extra' as const, name: `reference ${i + 1}` }))
-  )
-  onProgress?.(`正在出视频（${blobs.length} 张参考图）...`)
-  // 自由图生视频节点以输入框为唯一真源。生成按钮不得优化、清洗或回写提示词。
-  const sendPrompt = prompt
-  const result = await generateVideo(
-    {
+  if (caps.aspectControl && !caps.ratios.includes(aspectRatio)) throw new Error('当前模型不支持此比例，请在视频参数中重新选择。')
+  const imageSlots = buildH3ImageSlots(blobs.map((_, i) => ({ kind: 'extra' as const, name: `reference ${i + 1}` })))
+  const count = videoBatchCount(data.videoCount)
+  const outputs: string[] = []
+  let lastAsset: Awaited<ReturnType<typeof assets.add>> | undefined
+  async function persist(patch: Partial<CanvasNode['data']>) {
+    const source = p!.canvas?.nodes.find(n => n.id === nodeId)
+    if (project.current?.id === p!.id) { project.patchCanvasNode(nodeId, patch); await project.save() }
+    else if (source) {
+      source.data = { ...source.data, ...patch }; p!.updatedAt = Date.now()
+      const { saveProject } = await import('@/services/storage/idb'); await saveProject(p!)
+    }
+  }
+  for (let index = 0; index < count; index++) {
+    ensureNotCancelled(signal)
+    if (project.current?.id !== p.id) throw new Error('已切换项目，停止后续视频生成。')
+    if (!p.canvas?.nodes.some(n => n.id === nodeId)) throw new Error('视频节点已删除，停止后续生成。')
+    onProgress?.(count > 1 ? `正在生成第${index + 1}/${count}条视频…` : '正在出视频…')
+    const result = await generateVideo({
       ...audioInput,
-      referenceBindings: videoReferenceBindings(useFl2va ? [firstId!, lastId!] : ids, referenceAudioIds(node.data), useFl2va ? [] : node.data.videoReferenceOrder),
-      prompt: sendPrompt,
-      promptAsIs: true,
-      imageBlob: blobs[0],
-      referenceImages: useFl2va ? [] : blobs.slice(1),
-      lastFrameBlob: useFl2va ? blobs[1] : undefined,
-      imageSlots,
-      duration,
-      width: videoSize.width,
-      height: videoSize.height,
-      aspectRatio,
-      voiceMode: 'none',
-      promptStyle: 'scene-narrative',
-      videoModel,
-      videoProfileId: node.data.videoProfileId,
-      seed: node.data.generationSeed,
-      videoResolution: videoModel === 'h3' && isNativeH3VideoProfile(getVideoConfig(node.data.videoProfileId))
-        ? normalizeNativeH3Resolution(node.data.videoResolution) : node.data.videoResolution,
-      videoAudioEnabled: node.data.videoAudioEnabled,
-      h3GenMode: useFl2va ? 'fl2va' : 'reference',
-      mode: 'R2VA',
-      signal,
-      resumeTaskId: node.data.videoTaskId,
-      onTaskSubmitted: async (taskId) => {
-        project.patchCanvasNode(nodeId, { videoTaskId: taskId })
-        await project.save()
-      }
-    },
-    onProgress
-  )
-  const asset = await assets.add(result.blob, 'video', 'ai-generated', {
-    generation: result.generation,
-    filename: `${node.data.label || '视频'}.mp4`,
-    prompt: result.prompt,
-    projectId: p.id
-  })
-  project.patchCanvasNode(nodeId, { outputAssetId: asset.id, videoTaskId: undefined })
-  onProgress?.('视频已写入节点')
-  await project.save()
-  return asset
+      referenceBindings: bindings,
+      prompt: submittedPrompt, promptAsIs: true,
+      imageBlob: blobs[0], referenceImages: useFl2va ? [] : blobs.slice(1), lastFrameBlob: useFl2va ? blobs[1] : undefined,
+      imageSlots, duration, width: videoSize.width, height: videoSize.height,
+      aspectRatio, videoAspectAuto: caps.adaptiveAspect && data.videoAspectAuto,
+      voiceMode: 'none', promptStyle: 'scene-narrative', videoModel, videoProfileId: data.videoProfileId,
+      seed: data.generationSeed == null ? undefined : data.generationSeed + index,
+      videoResolution: caps.native ? normalizeNativeH3Resolution(data.videoResolution) : data.videoResolution,
+      videoAudioEnabled: data.videoAudioEnabled,
+      videoGenerationMode: mode,
+      h3GenMode: useFl2va ? 'fl2va' : mode === 'image' ? undefined : 'reference',
+      mode: mode === 'text' ? 'T2VA' : mode === 'image' || useFl2va ? 'I2VA' : 'R2VA',
+      signal, resumeTaskId: index === 0 ? data.videoTaskId : undefined,
+      onTaskSubmitted: async taskId => { await persist({ videoTaskId: taskId }) }
+    }, onProgress)
+    ensureNotCancelled(signal)
+    const asset = await assets.add(result.blob, 'video', 'ai-generated', {
+      generation: result.generation, filename: `${data.label || '视频'}${count > 1 ? `-${index + 1}` : ''}.mp4`, prompt: result.prompt, projectId: p.id
+    })
+    outputs.push(asset.id)
+    await persist({ outputAssetId: outputs[0], outputAssetIds: [...outputs], videoTaskId: undefined, ...(caps.audioSync ? { duration: result.duration } : {}) })
+    onProgress?.(`已保存${outputs.length}/${count}条视频`)
+    lastAsset = asset
+  }
+  return lastAsset!
 }
 
 export async function optimizeFreeformVideoPrompt(nodeId: string, signal?: AbortSignal): Promise<string> {
@@ -2670,41 +2734,47 @@ export async function optimizeFreeformVideoPrompt(nodeId: string, signal?: Abort
   if (!p) throw new Error('没有打开的项目')
   const node = p.canvas?.nodes.find((n) => n.id === nodeId)
   if (!node || node.type !== 'videoGen') throw new Error('找不到图生视频节点')
-  const source = compileVideoReferenceTokens((node.data.prompt || '').trim(), videoReferenceBindings(resolvedCanvasReferenceAssetIds(p, node), referenceAudioIds(node.data), node.data.videoReferenceOrder), true)
+  const sourceState = JSON.stringify(node.data)
+  const caps = videoNodeCapabilities(node.data, getVideoConfig(node.data.videoProfileId))
+  const mode = videoNodeMode(node.data, caps)
+  const ids = resolvedCanvasReferenceAssetIds(p, node), audioIds = referenceAudioIds(node.data)
+  const active = videoNodeReferenceIds(node.data, caps, ids, audioIds)
+  const frameMode = mode === 'image' || mode === 'first-last'
+  const bindings = videoReferenceBindings(active.images, active.audios, frameMode ? [] : node.data.videoReferenceOrder)
+  const visible = frameMode ? bindings : videoReferenceBindings(ids, audioIds, node.data.videoReferenceOrder)
+  const source = compileVideoReferenceTokens(bindLegacyVideoReferences((node.data.prompt || '').trim(), visible), bindings, true)
   if (!source) throw new Error('请先写提示词')
-  const videoModel = normalizeVideoGenModel(node.data.videoModel)
   const aspectRatio = canvasNodeAspect(node, p.settings.aspectRatio)
   const videoSize = aspectToSize(aspectRatio)
-  const slotEntries = canvasReferenceSlotEntries(p, node)
-  const imageSlots = buildH3ImageSlots(
-    slotEntries.length
-      ? slotEntries
-      : [{ kind: 'extra' as const, name: 'reference 1' }]
-  )
+  const imageSlots = buildH3ImageSlots(active.images.map((_, i) => ({ kind: 'extra' as const, name: `reference ${i + 1}` })))
+  const duration = videoNodeDuration(node.data.duration, caps)
   const cueLines = extractSpokenFromNotes(
     source.replace(/<d>\s*\[[^\]]*\]\s*[\s\S]*?<\/d>/gi, '')
   ).filter((line, i, all) => line && all.indexOf(line) === i)
   const hasSpeech = cueLines.length > 0
   const compiled = ensurePictureIdentity(
     await compileH3OfficialPrompt({
-    prompt: `【节点当前提示词。场记、时长、画风、图1图2身份都是画面，不是台词。只有引号或「台词/对白」里的原词才进 <d>。必须写清图1是谁、图2是谁、图3是谁。】\n${source}`,
+    prompt: `【节点当前提示词。场记、时长、画风、图1图2身份都是画面，不是台词。只有引号或「台词/对白」里的原词才进 <d>。只使用本次提供的素材编号，不要虚构额外图片或声音。】\n${source}`,
     aesthetic: p.script?.h3Aesthetic || p.script?.aesthetic,
     voiceover: cueLines.join('\n'),
     voiceMode: hasSpeech ? 'dialogue' : 'none',
     imageAssignments: imageSlots.map((slot) => slot.job),
     imageSlots,
-    duration: clampVideoDuration(node.data.duration, videoModel, 8),
+    duration: duration,
     width: videoSize.width,
     height: videoSize.height,
     aspectRatio,
     cameraMovement: 'static',
     promptStyle: getVideoPromptStyle(),
-    mode: 'R2VA',
+    mode: frameMode ? 'I2VA' : mode === 'text' ? 'T2VA' : 'R2VA',
     forceIntegrated: true,
     signal
   }),
-    { prompt: '', imageSlots, duration: clampVideoDuration(node.data.duration, videoModel, 8) }
+    { prompt: '', imageSlots, duration: duration }
   )
+  ensureNotCancelled(signal)
+  const latest = project.current?.canvas?.nodes.find(n => n.id === nodeId)
+  if (project.current?.id !== p.id || !latest || JSON.stringify(latest.data) !== sourceState) throw new Error('节点内容、参数或素材已变化，请重新优化。')
   project.setCanvasNodePrompt(nodeId, compiled)
   await project.save()
   return compiled
@@ -2716,7 +2786,7 @@ export async function runCanvasNode(
   signal?: AbortSignal,
   opts?: NodeRunOpts
 ) {
-  return withNodeJob(nodeId, async () => {
+  return withNodeJob(nodeId, async (signal) => {
     pendingRun = { hd: Boolean(opts?.hd) }
     ensureNotCancelled(signal)
     const project = useProjectStore()
@@ -2789,20 +2859,31 @@ export async function runCanvasNode(
       } else {
         throw new Error(`未知节点类型：${node.type}`)
       }
+      ensureNotCancelled(signal)
       patchNode(project, nodeId, 'success')
       if (node.type === 'export') patchNode(project, 'final', 'success')
       if (node.type === 'final') patchNode(project, 'export', 'success')
       activity.done(`${label}已完成`)
     } catch (e: any) {
-      patchNode(project, nodeId, 'failed', e?.message ?? String(e))
-      if (node.type === 'export') patchNode(project, 'final', 'failed', e?.message ?? String(e))
-      if (node.type === 'final') patchNode(project, 'export', 'failed', e?.message ?? String(e))
+      const cancelled = !isTimeoutAbort(e, signal) && (signal.aborted || isAbortError(e))
+      const status = cancelled ? 'cancelled' : 'failed'
+      if (project.current?.id === p.id) {
+        patchNode(project, nodeId, status, e?.message ?? String(e))
+        if (node.type === 'export') patchNode(project, 'final', status, e?.message ?? String(e))
+        if (node.type === 'final') patchNode(project, 'export', status, e?.message ?? String(e))
+        if (cancelled) {
+          // A deliberate retry must never resume a cancelled cloud task.
+          project.patchCanvasNode(nodeId, { videoTaskId: undefined })
+          if (node.data.shotId) project.updateShot(node.data.shotId, { videoTaskId: undefined })
+          await project.save()
+        }
+      }
       activity.fail(e)
       throw e
     } finally {
       pendingRun = {}
     }
-  })
+  }, signal)
 }
 
 export async function generateMissingSheets(onProgress?: (msg: string) => void, signal?: AbortSignal) {

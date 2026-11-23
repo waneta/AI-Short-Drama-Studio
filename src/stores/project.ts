@@ -210,6 +210,8 @@ export const useProjectStore = defineStore('project', () => {
       p.agentState = {
         autonomy: p.agentState?.autonomy ?? 'gated',
         messages: p.agentState?.messages ?? [],
+        activeConversationId: p.agentState?.activeConversationId,
+        conversations: p.agentState?.conversations,
         tasks: (p.agentState?.tasks ?? []).map((t) =>
           t.status === 'running' ? { ...t, status: 'cancelled' as const, finishedAt: Date.now() } : t
         ),
@@ -479,7 +481,7 @@ export const useProjectStore = defineStore('project', () => {
     touch()
   }
 
-  /** 人声方案属于视频生成条件；切换时保留旧视频到历史并要求局部重做。 */
+  /** 切换人声方案保留已有视频；TTS在导出时替换音轨，后续生成按新方案执行。 */
   function setShotAudioMode(id: ID, audioMode: ShotAudioMode) {
     if (!current.value) return
     const idx = current.value.shots.findIndex((s) => s.id === id)
@@ -490,13 +492,12 @@ export const useProjectStore = defineStore('project', () => {
     current.value.shots[idx] = {
       ...shot,
       audioMode,
-      videoHistoryIds: pushHistory(shot.videoAssetId, '', shot.videoHistoryIds).filter(Boolean),
-      videoAssetId: undefined,
+      videoTaskId: undefined,
       audioHistoryIds: keepTts
         ? shot.audioHistoryIds
         : pushHistory(shot.audioAssetId, '', shot.audioHistoryIds).filter(Boolean),
       audioAssetId: keepTts ? shot.audioAssetId : undefined,
-      status: shot.imageAssetId ? 'image-generated' : 'draft'
+      status: shot.videoAssetId ? 'video-generated' : shot.imageAssetId ? 'image-generated' : 'draft'
     }
     touch()
   }
@@ -664,10 +665,13 @@ export const useProjectStore = defineStore('project', () => {
         prompt: src.data.prompt || '',
         referenceAssetIds: [...(src.data.referenceAssetIds ?? [])],
         referenceSourceNodeIds: [...(src.data.referenceSourceNodeIds ?? [])],
+        referenceImageOrder: src.data.referenceImageOrder ? [...src.data.referenceImageOrder] : undefined,
         duration: src.data.duration ?? 8,
         aspectRatio: src.data.aspectRatio ?? p.settings.aspectRatio,
         imageProfileId: src.data.imageProfileId,
         imageModel: src.data.imageModel,
+        imageQuality: src.data.imageQuality,
+        imageCount: src.data.imageCount,
         generationSeed: src.data.generationSeed,
         imageResolution: src.data.imageResolution,
         imageWidth: src.data.imageWidth,
@@ -675,6 +679,8 @@ export const useProjectStore = defineStore('project', () => {
         ...(type === 'videoGen'
           ? {
               videoModel: normalizeVideoGenModel(src.data.videoModel),
+              videoGenerationMode: src.data.videoGenerationMode,
+              videoCount: src.data.videoCount,
               h3GenMode: normalizeH3GenMode(src.data.h3GenMode),
               firstFrameAssetId: src.data.firstFrameAssetId,
               lastFrameAssetId: src.data.lastFrameAssetId,
@@ -697,12 +703,36 @@ export const useProjectStore = defineStore('project', () => {
     return copy.id
   }
 
+  /** Delete the visual edge and release its upstream reference binding together. */
+  function removeCanvasEdges(ids: string[]) {
+    const canvas = current.value?.canvas
+    if (!canvas) return
+    const drop = new Set(ids)
+    const removed = canvas.edges.filter((edge) => drop.has(edge.id))
+    if (!removed.length) return
+    canvas.edges = canvas.edges.filter((edge) => !drop.has(edge.id))
+    for (const edge of removed) {
+      if (canvas.edges.some((other) => other.source === edge.source && other.target === edge.target)) continue
+      const target = canvas.nodes.find((node) => node.id === edge.target)
+      if (target && (target.type === 'imageGen' || target.type === 'videoGen')) {
+        target.data.referenceSourceNodeIds = (target.data.referenceSourceNodeIds ?? []).filter((id) => id !== edge.source)
+      }
+    }
+    touch()
+  }
+
   function removeCanvasNode(id: string) {
     if (!current.value?.canvas) return
     current.value.canvas.nodes = current.value.canvas.nodes.filter((n) => n.id !== id)
     current.value.canvas.edges = current.value.canvas.edges.filter(
       (e) => e.source !== id && e.target !== id
     )
+    touch()
+  }
+
+  function setAssetOrganization(value: NonNullable<Project['assetOrganization']>) {
+    if (!current.value) return
+    current.value.assetOrganization = value
     touch()
   }
 
@@ -840,6 +870,7 @@ export const useProjectStore = defineStore('project', () => {
     setFinalVideo,
     setAgentState,
     patchAgentState,
+    setAssetOrganization,
     setCanvas,
     patchCanvasNode,
     setCanvasNodePrompt,
@@ -848,6 +879,7 @@ export const useProjectStore = defineStore('project', () => {
     addCanvasNode,
     duplicateCanvasNode,
     removeCanvasNode,
+    removeCanvasEdges,
     syncCanvasFromProject,
     setAspectRatio,
     setPlayApproved,

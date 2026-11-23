@@ -83,7 +83,7 @@ onBeforeUnmount(() => {
 })
 
 function setMode(next: ShotAudioMode) {
-  if (!shot.value) return
+  if (!shot.value || generating.value) return
   project.setShotAudioMode(shot.value.id, next)
 }
 
@@ -171,6 +171,7 @@ function openDetail() {
             :key="m.id"
             type="button"
             :class="{ on: mode === m.id }"
+            :disabled="generating"
             @click="setMode(m.id)"
           >
             {{ m.label }}

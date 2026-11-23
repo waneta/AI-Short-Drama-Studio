@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import { useProjectStore, useToastStore } from '@/stores'
 import { groupGenerateJobId, runExtractGroup, runGenerateGroup } from '@/services/canvas/runner'
 import { isNodeRunning } from '@/services/canvas/jobs'
@@ -10,6 +10,7 @@ import NodeBusyOverlay from '@/components/canvas/NodeBusyOverlay.vue'
 
 const props = defineProps<{
   id: string
+  selected?: boolean
   data: {
     label?: string
     kind?: string
@@ -18,6 +19,30 @@ const props = defineProps<{
 
 const project = useProjectStore()
 const toast = useToastStore()
+
+const custom = computed(() => props.data.kind === 'custom')
+const title = computed(() => project.current?.canvas?.nodes.find(n => n.id === props.id)?.data.label || props.data.label || '组合')
+const renaming = ref(false), draft = ref(''), titleInput = ref<HTMLInputElement>()
+let renameProjectId: string | undefined
+async function beginRename() {
+  if (!custom.value || renaming.value) return
+  renameProjectId = project.current?.id; draft.value = title.value; renaming.value = true
+  await nextTick(); titleInput.value?.focus(); titleInput.value?.select()
+}
+function saveName() {
+  if (!renaming.value) return
+  renaming.value = false
+  const label = draft.value.trim()
+  if (!label || project.current?.id !== renameProjectId) return
+  project.patchCanvasNode(props.id, { label })
+  const group = project.current?.canvas?.groups.find(g => g.id === props.id)
+  if (group) group.label = label
+}
+function nameKey(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  if (event.key === 'Enter') { event.preventDefault(); saveName() }
+  if (event.key === 'Escape') { event.preventDefault(); renaming.value = false }
+}
 
 const extractable = computed(() => {
   if (props.data.kind === 'subject' || props.data.kind === 'scene' || props.data.kind === 'shot') return true
@@ -124,9 +149,12 @@ async function generateAll(ev: Event) {
 </script>
 
 <template>
-  <div class="gframe" :class="[data.kind ? `tint-${data.kind}` : '', { busy }]">
+  <div class="gframe" :class="[data.kind ? `tint-${data.kind}` : '', { busy, 'custom-group': custom, selected }]">
     <div class="gframe-h">
-      <span>{{ data.label || '分组' }}</span>
+      <span class="group-name nokey" :role="custom ? 'button' : undefined" :tabindex="custom && !renaming ? 0 : undefined" :title="custom ? `${title}（双击重命名）` : title" @dblclick.stop.prevent="beginRename" @keydown.enter.prevent.stop="beginRename" @keydown.f2.prevent.stop="beginRename">
+        <input v-if="renaming" ref="titleInput" v-model="draft" class="group-name-input nodrag nopan nokey" aria-label="组合名称" @pointerdown.stop @mousedown.stop @click.stop @dblclick.stop @keydown.stop="nameKey" @blur="saveName" />
+        <template v-else>{{ title }}</template>
+      </span>
       <div v-if="extractable || generatable" class="gframe-actions nodrag nopan">
         <button
           v-if="extractable"
@@ -154,6 +182,7 @@ async function generateAll(ev: Event) {
         </button>
       </div>
     </div>
+    <template v-if="custom"><span v-for="side in ['top','right','bottom','left']" :key="side" class="group-border" :class="`border-${side}`" aria-hidden="true" /></template>
     <NodeBusyOverlay v-if="busy" :label="overlayLabel" />
   </div>
 </template>
@@ -229,4 +258,15 @@ async function generateAll(ev: Event) {
   background: var(--color-canvas-group);
   border-color: rgba(255, 255, 255, 0.08);
 }
+.custom-group { pointer-events:none; border-radius:12px; border:1px solid color-mix(in srgb,var(--color-text-3) 35%,transparent); background:color-mix(in srgb,var(--color-text-3) 3%,transparent); cursor:grab; }
+.custom-group.selected { border-color:var(--color-accent); box-shadow:0 0 0 1px var(--color-accent); }
+.custom-group .gframe-h { position:absolute; bottom:calc(100% + 7px); left:0; padding:0; width:100%; height:24px; font-size:12px; font-weight:500; letter-spacing:0; pointer-events:auto; }
+.group-name { display:block; max-width:100%; }
+.custom-group .group-name { min-width:100px; cursor:grab; }
+.group-border { position:absolute; pointer-events:auto; cursor:grab; }
+.border-top,.border-bottom { left:0; width:100%; height:8px; }
+.border-top { top:-4px; } .border-bottom { bottom:-4px; }
+.border-left,.border-right { top:0; height:100%; width:8px; }
+.border-left { left:-4px; } .border-right { right:-4px; }
+.group-name-input { box-sizing:border-box; width:100%; min-width:120px; height:24px; border:1px solid var(--color-accent); border-radius:4px; background:var(--color-bg-1); color:var(--color-text-1); padding:2px 5px; font:inherit; user-select:text; cursor:text; outline:none; }
 </style>

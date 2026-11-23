@@ -2,13 +2,13 @@ import http from 'node:http'
 import https from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Plugin } from 'vite'
-import { isAlibabaResultUrl, isTokenPlanApiUrl, TOKEN_PLAN_ORIGIN } from '../src/services/ai/tokenPlanWebProxy'
+import { isAlibabaResultUrl, isTokenPlanApiUrl, TOKEN_PLAN_ORIGIN, ARK_IMAGE_ORIGIN, isArkImageApiUrl } from '../src/services/ai/tokenPlanWebProxy'
 
 /** Test-only overrides are passed in code; browser requests cannot change the upstream. */
-export function tokenPlanWebProxy(options: { apiOrigin?: string; mediaOrigin?: string } = {}): Plugin {
+export function tokenPlanWebProxy(options: { apiOrigin?: string; mediaOrigin?: string; arkOrigin?: string } = {}): Plugin {
   const middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => {
     const raw = req.url || ''
-    if (!/^\/token-plan-(?:api(?:\/|$)|media(?:\?|$))/.test(raw)) return next()
+    if (!/^(?:\/token-plan-(?:api(?:\/|$)|media(?:\?|$))|\/ark-image-api(?:\/|$))/.test(raw)) return next()
     const fail = (status: number, message: string) => {
       res.statusCode = status
       res.setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -23,8 +23,14 @@ export function tokenPlanWebProxy(options: { apiOrigin?: string; mediaOrigin?: s
     }
     let target: URL
     let media = false
+    let ark = false
     try {
-      if (raw.startsWith('/token-plan-api/')) {
+      if (raw.startsWith('/ark-image-api/')) {
+        ark = true
+        target = new URL(raw.slice('/ark-image-api'.length), ARK_IMAGE_ORIGIN)
+        if (!isArkImageApiUrl(target)) return fail(403, '仅支持火山方舟官方生图接口')
+        if (req.method !== 'POST') return fail(405, '生图接口仅支持POST')
+      } else if (raw.startsWith('/token-plan-api/')) {
         target = new URL(raw.slice('/token-plan-api'.length), TOKEN_PLAN_ORIGIN)
         if (!isTokenPlanApiUrl(target)) return fail(403, '仅支持已配置的 Token Plan 模型接口')
         const poll = target.pathname.startsWith('/api/v1/tasks/')
@@ -39,13 +45,13 @@ export function tokenPlanWebProxy(options: { apiOrigin?: string; mediaOrigin?: s
     } catch { return fail(400, '无效的转发地址') }
 
     // Keep the original signed path/query when replacing the origin in an isolated test.
-    const override = media ? options.mediaOrigin : options.apiOrigin
+    const override = media ? options.mediaOrigin : ark ? options.arkOrigin : options.apiOrigin
     if (override) target = new URL(target.pathname + target.search, override)
     const headers: Record<string, string> = { Accept: media ? '*/*' : 'application/json' }
     if (!media) {
       if (req.headers.authorization) headers.Authorization = req.headers.authorization
       if (req.headers['content-type']) headers['Content-Type'] = String(req.headers['content-type'])
-      if (req.headers['x-dashscope-async']) headers['X-DashScope-Async'] = String(req.headers['x-dashscope-async'])
+      if (!ark && req.headers['x-dashscope-async']) headers['X-DashScope-Async'] = String(req.headers['x-dashscope-async'])
     }
     const request = target.protocol === 'https:' ? https.request : http.request
     const upstream = request(target, { method: req.method, headers }, response => {
@@ -59,7 +65,7 @@ export function tokenPlanWebProxy(options: { apiOrigin?: string; mediaOrigin?: s
     })
     upstream.setTimeout(180_000, () => upstream.destroy(new Error('timeout')))
     upstream.on('error', error => {
-      if (!res.headersSent) fail(502, `本机无法连接${media ? '阿里云媒体存储' : 'Token Plan 接口'}：${error.message}`)
+      if (!res.headersSent) fail(502, `本机无法连接${media ? '阿里云媒体存储' : ark ? '火山方舟接口' : 'Token Plan 接口'}：${error.message}`)
       else res.destroy()
     })
     req.on('aborted', () => upstream.destroy())

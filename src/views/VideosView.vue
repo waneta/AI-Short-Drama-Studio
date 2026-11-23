@@ -1,12 +1,17 @@
 <script setup lang="ts">
+import TtsSourceAudioSelect from '@/components/common/TtsSourceAudioSelect.vue'
+import RecoverShotVideos from '@/components/common/RecoverShotVideos.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { useProjectStore, useAssetsStore, useToastStore } from '@/stores'
+import { useProjectStore, useAssetsStore, useToastStore, useSettingsStore } from '@/stores'
 import { needsShotFrames, shotUsesFrames, stillModeForShot, shotMissingStill } from '@/utils/videoStill'
-import { applyShotVideoModel } from '@/services/canvas/videoModel'
+import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
 import { generateShotVideo, generateShotFramePair, isFl2vaChainActive, rewriteShotPerformance, optimizeShotVideoPrompt } from '@/services/canvas/runner'
 import { mapPool, VIDEO_GEN_CONCURRENCY } from '@/services/canvas/jobs'
-import { getVideoPromptStyle } from '@/services/ai/runtime'
+import { getVideoPromptStyle, autodlVideoProfileId } from '@/services/ai/runtime'
+import { VIDEO_H3_V5_10S_WORKFLOW_ID } from '@/services/ai/env'
+import { autodlWorkflowForProfile } from '@/services/ai/autodl'
+import { videoPromptWithSpeechPolicy, shotSpeechPolicy } from '@/services/ai/videoSpeechPolicy'
 import { effectiveShotAudioMode } from '@/utils/shot'
 import GlassCard from '@/components/common/GlassCard.vue'
 import GradientButton from '@/components/common/GradientButton.vue'
@@ -38,6 +43,7 @@ const router = useRouter()
 const project = useProjectStore()
 const assets = useAssetsStore()
 const toast = useToastStore()
+const settings = useSettingsStore()
 
 const generating = ref<Set<string>>(new Set())
 const optimizing = ref<Set<string>>(new Set())
@@ -150,7 +156,27 @@ function shotVideoNodeId(shot: Shot) {
 
 function shotVideoModel(shot: Shot): VideoGenModel {
   const node = project.current?.canvas?.nodes.find((n) => n.type === 'shotVideo' && n.data.shotId === shot.id)
-  return normalizeVideoGenModel(node?.data.videoModel)
+  return normalizeVideoGenModel(node?.data.videoModel || settings.config.defaultVideoModel)
+}
+
+function shotVideoProfileId(shot: Shot) {
+  const node = project.current?.canvas?.nodes.find(n => n.type === 'shotVideo' && n.data.shotId === shot.id)
+  const bound = node?.data.videoProfileId || shot.videoProfileId
+  if (bound) return bound
+  const model = shotVideoModel(shot)
+  return model === 'h3-v5' ? autodlVideoProfileId(VIDEO_H3_V5_10S_WORKFLOW_ID) : model === 'wan-prime' ? undefined : settings.config.activeVideoId
+}
+function shotVideoWorkflowId(shot: Shot) {
+  return settings.config.videos.find(p => p.id === shotVideoProfileId(shot))?.workflowId || ''
+}
+function shotSpeechPlan(shot: Shot) {
+  const profile = settings.config.videos.find(p => p.id === shotVideoProfileId(shot))
+  return shotSpeechPolicy(shot, project.current, autodlWorkflowForProfile(profile)?.mode === 'audio-sync')
+}
+function setShotVideoProfile(shot: Shot, profileId: string) {
+  const id = shotVideoNodeId(shot)
+  if (id) applyShotVideoProfile(id, profileId)
+  else if (settings.config.videos.some(p => p.id === profileId)) project.updateShot(shot.id, { videoProfileId: profileId, videoTaskId: undefined })
 }
 
 function shotVideoResolution(shot: Shot): VideoResolution {
@@ -244,11 +270,11 @@ function changeAudioMode(shot: Shot, mode: NonNullable<Shot['audioMode']>) {
   if (effectiveShotAudioMode(shot) === mode) return
   const hadVideo = Boolean(shot.videoAssetId)
   project.setShotAudioMode(shot.id, mode)
-  if (hadVideo) toast.info('人声方案已改变，旧视频已放入历史；请重新生成本镜以避免声音或口型不匹配。', 6000)
+  if (hadVideo) toast.info(mode === 'tts' ? '已保留视频和配音，导出原声按本镜“TTS原声”选项处理。' : '已保留视频；新的人声生成要求在下次生成视频时生效。', 6000)
 }
 
 function composedPrompt(shot: Shot) {
-  return shot.compiledVideoPrompt ?? ''
+  return videoPromptWithSpeechPolicy(shot.compiledVideoPrompt ?? '', shotSpeechPlan(shot))
 }
 
 function toggleExpanded(id: string) {
@@ -373,6 +399,7 @@ function next() {
         <GradientButton icon="→" @click="next">下一步：剪辑</GradientButton>
       </div>
     </header>
+    <RecoverShotVideos :disabled="generating.size > 0" @restored="loadVideos(); loadHistory()" />
 
     <GlassCard v-if="shotsWithoutStill.length > 0" padding="md" class="warn-card">
       ⚠️ 还有 {{ shotsWithoutStill.length }} 个分镜缺当前模型需要的参考图。H3 只需要人设和场景；万相需要四宫格关键帧。
@@ -491,8 +518,9 @@ function next() {
         <div class="shot-info">
           <NativeH3VideoControls v-if="!isDigitalHuman" :node-id="shotVideoNodeId(shot)" />
           <div v-if="!isDigitalHuman" class="info-row">
-            <VideoModelSelect :model-value="shotVideoModel(shot)" @update:model-value="setShotVideoModel(shot, $event)" />
+            <VideoModelSelect :node-id="shotVideoNodeId(shot)" :model-value="shotVideoModel(shot)" :profile-id="shotVideoProfileId(shot)" @update:model-value="setShotVideoModel(shot, $event)" @select-profile="setShotVideoProfile(shot, $event)" />
           </div>
+          <div v-if="!isDigitalHuman && shotVideoWorkflowId(shot)" class="workflow-id" :title="shotVideoWorkflowId(shot)">工作流：{{ shotVideoWorkflowId(shot) }}</div>
           <div v-if="!isDigitalHuman && videoAllows1080p(shotVideoModel(shot)) && shotH3Mode(shot) !== 'fl2va'" class="info-row">
             <span>清晰度</span>
             <VideoResolutionSeg
@@ -532,11 +560,12 @@ function next() {
             <select
               class="cam-select"
               :value="effectiveShotAudioMode(shot)"
+              :disabled="generating.has(shot.id)"
               @change="changeAudioMode(shot, ($event.target as HTMLSelectElement).value as NonNullable<Shot['audioMode']>)"
             >
               <option value="h3-dialogue">H3 出镜对白 + 对口型</option>
               <option value="h3-voiceover">H3 画外口播 + 人物闭嘴</option>
-              <option value="tts">后期 TTS + H3 不说话</option>
+              <option value="tts">后期 TTS（可保留环境原声）</option>
               <option value="none">无口播，仅环境声</option>
             </select>
           </label>
@@ -546,16 +575,18 @@ function next() {
           </div>
         </div>
 
+        <TtsSourceAudioSelect v-if="!isDigitalHuman" :shot-id="shot.id" :disabled="generating.has(shot.id)" />
+        <p v-if="shotSpeechPlan(shot)" class="audio-policy-note">后期TTS和无口播会在提交副本中移除明确对白及说话指令，只要求环境与动作音效；原稿和字幕台词保留。模型仍可能生成人声，“保留原声”会保留这些声音，可在实际提交提示词中核对。</p>
         <div class="shot-prompt">
           <div class="prompt-bar">
-            <div class="prompt-label">实际提交给视频模型的提示词</div>
+            <div class="prompt-label">视频提示词</div>
             <div class="prompt-tools">
               <button class="reset-btn" :disabled="optimizing.has(shot.id)" @click="optimizeVideoPrompt(shot)">
                 {{ optimizing.has(shot.id) ? '优化中…' : '优化提示词' }}
               </button>
               <button class="reset-btn" @click="resetVideoPrompt(shot)">按分镜动作重写</button>
               <button class="reset-btn" @click="toggleExpanded(shot.id)">
-                {{ expanded.has(shot.id) ? '收起 H3 提交格式' : '看 H3 提交格式' }}
+                {{ expanded.has(shot.id) ? '收起实际提交提示词' : '看实际提交提示词' }}
               </button>
             </div>
           </div>
@@ -613,6 +644,7 @@ function next() {
 </template>
 
 <style scoped>
+.workflow-id{grid-column:1/-1;overflow-wrap:anywhere;color:var(--color-text-4);font-size:10px}.audio-policy-note{font-size:11px;line-height:1.6;color:var(--color-text-3);margin:8px 0;}
 .page {
   padding: var(--space-6);
   max-width: 1400px;

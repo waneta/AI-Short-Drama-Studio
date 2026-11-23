@@ -1,25 +1,31 @@
 <script setup lang="ts">
+import { stopNodeDragFromControls } from '@/utils/nodeDrag'
 import { computed, nextTick, ref, watch } from 'vue'
+import { useReferenceReorder } from '@/composables/useReferenceReorder'
 import { useAssetsStore, useLibraryStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
 import { isNodeRunning } from '@/services/canvas/jobs'
 import { referenceAudioIds, videoReferenceBindings } from '@/services/canvas/videoReferences'
-import { resolvedCanvasReferenceAssetIds } from '@/services/canvas/references'
+import { canvasReferenceImageOrder, resolvedCanvasReferenceAssetIds } from '@/services/canvas/references'
 import { videoRefSlots } from '@/utils/consistency'
 import { bindLegacyVideoReferences, videoReferenceParts, videoReferenceToken } from '@/services/ai/videoReferenceTokens'
-import { isNativeH3VideoProfile } from '@/services/ai/nativeH3VideoSettings'
+import { videoNodeCapabilities } from '@/services/ai/videoNodeCapabilities'
 import { normalizeVideoGenModel, videoMaxRefImages } from '@/types'
 import { openLightbox } from '@/composables/useLightbox'
 import { pickLocalFiles } from '@/utils/pickLocalFiles'
 import AssetPicker from '@/components/common/AssetPicker.vue'
 
-const props = defineProps<{ nodeId: string; modelValue?: string; disabled?: boolean; audioOnly?: boolean; referencesOnly?: boolean }>()
+const props = defineProps<{ nodeId: string; modelValue?: string; disabled?: boolean; audioOnly?: boolean; referencesOnly?: boolean; allowAudio?: boolean; audioSync?: boolean; maxAudios?: number; maxImages?: number; hideActions?: boolean; draggableBackground?: boolean; imageAssetIds?: string[]; audioAssetIds?: string[]; hideReferences?: boolean; placeholder?: string }>()
+function onPointerStart(event: Event) {
+  stopNodeDragFromControls(event, !props.draggableBackground)
+}
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 const project = useProjectStore(), assets = useAssetsStore(), library = useLibraryStore()
 const settings = useSettingsStore(), toast = useToastStore()
 const node = computed(() => project.current?.canvas?.nodes.find(item => item.id === props.nodeId))
 const shot = computed(() => project.current?.shots.find(item => item.id === node.value?.data.shotId))
-const audioIds = computed(() => referenceAudioIds(node.value?.data))
+const audioIds = computed(() => props.audioAssetIds ?? referenceAudioIds(node.value?.data))
 const imageIds = computed(() => {
+  if (props.imageAssetIds) return props.imageAssetIds
   if (props.audioOnly) return []
   const p = project.current, n = node.value
   if (!p || !n) return []
@@ -27,20 +33,43 @@ const imageIds = computed(() => {
 })
 const urls = ref<Record<string, string>>({}), activeAudio = ref<string>(), uploading = ref(false)
 const busy = computed(() => !!props.disabled || uploading.value || isNodeRunning(props.nodeId))
-const pickerKind = ref<'image' | 'audio'>('image'), pickerOpen = ref(false)
-const bindings = computed(() => videoReferenceBindings(imageIds.value, audioIds.value, node.value?.data.videoReferenceOrder))
+const pickerKind = ref<'image' | 'audio'>('image'), pickerOpen = ref(false), pickerTab = ref<'page' | 'library'>('page')
+const bindings = computed(() => videoReferenceBindings(imageIds.value, audioIds.value, props.hideReferences ? [] : node.value?.data.videoReferenceOrder))
 const refs = computed(() => {
   return [...bindings.value].sort((a, b) => a.number! - b.number!).map(item => {
     const meta = assets.getMeta(item.id) || library.getMeta(item.id)
     return { ...item, number: item.number!, label: `${item.kind === 'audio' ? '音频' : '图片'} ${item.number}`, filename: meta?.filename || item.id, duration: meta && 'duration' in meta ? meta.duration : 0 }
   })
 })
+const referenceSort = useReferenceReorder({
+  ids: () => refs.value.map(item => item.id),
+  scope: () => `${project.current?.id}:${props.nodeId}`,
+  disabled: () => busy.value,
+  commit: async ids => {
+    const n = node.value, p = project.current
+    if (!n || !p) return
+    // Bind numeric mentions against the OLD strip before its slot numbers change.
+    const text = bindLegacyVideoReferences(props.referencesOnly ? n.data.prompt || '' : props.modelValue || '', bindings.value)
+    const images = ids.filter(id => imageIds.value.includes(id))
+    const audios = ids.filter(id => audioIds.value.includes(id))
+    project.patchCanvasNode(n.id, {
+      prompt: text, videoTaskId: undefined, videoReferenceOrder: ids,
+      referenceAudioAssetIds: audios, referenceAudioAssetId: audios[0],
+      ...(n.type === 'videoGen' ? { referenceImageOrder: canvasReferenceImageOrder(p, n, images) } : {})
+    })
+    if (!props.referencesOnly) emit('update:modelValue', text)
+    if (n.data.shotId) project.updateShot(n.data.shotId, { videoTaskId: undefined })
+    try { await project.save() } catch (error: any) { toast.error(error?.message || '参考素材顺序保存失败') }
+  }
+})
 const issue = computed(() => {
+  if (props.audioSync) return audioIds.value.length > 1 ? '数字人口播仅支持一段驱动音频，请移除多余音频。' : ''
   if (!audioIds.value.length) return ''
   const n = node.value
   const profile = n?.data.videoProfileId ? settings.config.videos?.find(item => item.id === n.data.videoProfileId) : settings.config.video
-  if (normalizeVideoGenModel(n?.data.videoModel) !== 'h3' || !isNativeH3VideoProfile(profile)) return '当前模型不支持参考声音，请选择本地 MiniMax H3 接入。'
-  if (n?.data.h3GenMode === 'fl2va' || shot.value?.h3GenMode === 'fl2va' || (n?.type === 'shotVideo' && project.current?.settings.h3ShotChainMode === 'fl2va')) return '参考声音需要 H3「参考图」模式，请切换模式或移除声音。'
+  const caps = videoNodeCapabilities(n?.data || {}, profile)
+  if (!caps.audio) return '当前模型不支持参考声音，请选择支持声音的H3接入。'
+  if (n?.data.h3GenMode === 'fl2va' || shot.value?.h3GenMode === 'fl2va' || (!caps.autodlWorkflow && n?.type === 'shotVideo' && project.current?.settings.h3ShotChainMode === 'fl2va')) return '参考声音需要 H3「参考图」模式，请切换模式或移除声音。'
   if (n?.type === 'shotVideo' && project.current?.pipelineMode === 'smart-speech' && project.current.speechWorkflow?.mode === 'digital-human') return '数字人口播模式使用口播音频，请改用普通H3参考图模式。'
   return ''
 })
@@ -55,7 +84,8 @@ async function add(ids: string[], kind: 'image' | 'audio', uploadFiles?: File[])
   const n = node.value, p = project.current
   if (!n || !p || busy.value) return
   const old = kind === 'audio' ? audioIds.value : imageIds.value
-  const limit = kind === 'audio' ? 3 : videoMaxRefImages(normalizeVideoGenModel(n.data.videoModel))
+  if (kind === 'audio' && props.allowAudio === false) { toast.warn('当前模式仅使用图片参考，请切换到全能参考添加声音。'); return }
+  const limit = kind === 'audio' ? props.maxAudios ?? 3 : props.maxImages ?? videoMaxRefImages(normalizeVideoGenModel(n.data.videoModel))
   const unique = [...new Set(ids)].filter(id => !old.includes(id))
   const count = uploadFiles?.length ?? unique.length
   if (old.length + count > limit) { toast.warn(`最多支持 ${limit} ${kind === 'audio' ? '条参考声音' : '张参考图'}，请先移除多余素材。`); return }
@@ -84,10 +114,10 @@ async function add(ids: string[], kind: 'image' | 'audio', uploadFiles?: File[])
 async function upload() {
   if (busy.value) return
   try {
-    const files = (await pickLocalFiles({ kind: props.audioOnly ? 'audio' : 'media', multiple: true })).filter(file => file.type.startsWith('image/') || file.type.startsWith('audio/'))
+    const files = (await pickLocalFiles({ kind: props.audioOnly ? 'audio' : props.allowAudio === false ? 'image' : 'media', multiple: true })).filter(file => file.type.startsWith('image/') || file.type.startsWith('audio/'))
     // Validate the whole selection before importing any files.
-    if (audioIds.value.length + files.filter(f => f.type.startsWith('audio/')).length > 3) { toast.warn('H3最多支持3条参考声音，请减少音频素材。'); return }
-    if (imageIds.value.length + files.filter(f => f.type.startsWith('image/')).length > videoMaxRefImages(normalizeVideoGenModel(node.value?.data.videoModel))) { toast.warn('参考图超出模型上限，请减少图片。'); return }
+    if (audioIds.value.length + files.filter(f => f.type.startsWith('audio/')).length > (props.maxAudios ?? 3)) { toast.warn(`最多支持${props.maxAudios ?? 3}条声音，请减少音频素材。`); return }
+    if (imageIds.value.length + files.filter(f => f.type.startsWith('image/')).length > (props.maxImages ?? videoMaxRefImages(normalizeVideoGenModel(node.value?.data.videoModel)))) { toast.warn('参考图超出模型上限，请减少图片。'); return }
     for (const file of files) await add([], file.type.startsWith('audio/') ? 'audio' : 'image', [file])
   } catch (e: any) { toast.error(e?.message || '读取素材失败') }
 }
@@ -106,7 +136,7 @@ async function remove(id: string, kind: 'image' | 'audio') {
   if (activeAudio.value === id) activeAudio.value = undefined
   await project.save()
 }
-function pick(kind: 'image' | 'audio') { pickerKind.value = kind; pickerOpen.value = true }
+function pick(kind: 'image' | 'audio', tab: 'page' | 'library' = 'page') { if (busy.value || (kind === 'audio' && props.allowAudio === false)) return; pickerKind.value = kind; pickerTab.value = tab; pickerOpen.value = true }
 function preview(id: string, kind: 'image' | 'audio') {
   if (kind === 'audio') activeAudio.value = activeAudio.value === id ? undefined : id
   else if (urls.value[id]) openLightbox(urls.value[id], 'image')
@@ -177,7 +207,7 @@ watch([() => refs.value.map(item => `${item.id}:${item.number}`).join(','), urls
 watch(editor, () => render())
 const options = computed(() => {
   const query = menu.value?.query || ''
-  return refs.value.filter(item => /^\d+$/.test(query)
+  return refs.value.filter(item => (props.allowAudio !== false || item.kind !== 'audio')).filter(item => /^\d+$/.test(query)
     ? item.number === Number(query)
     : !query || `${item.label} ${item.filename}`.toLowerCase().includes(query.toLowerCase()))
 })
@@ -237,49 +267,62 @@ function keydown(event: KeyboardEvent) {
     if (from.length) { to.push(props.modelValue || ''); emit('update:modelValue', from.pop()!); menu.value = undefined }
     return
   }
-  if (event.key === 'Escape') { menu.value = undefined; return }
+  if (event.key === 'Escape' && menu.value) { event.preventDefault(); event.stopPropagation(); menu.value = undefined; return }
   if (menu.value && options.value.length) {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); menuIndex.value = (menuIndex.value + (event.key === 'ArrowDown' ? 1 : -1) + options.value.length) % options.value.length; return }
     if (event.key === 'Enter') { event.preventDefault(); void insert(options.value[menuIndex.value] || options.value[0]); return }
   }
   if (event.key === 'Enter') { event.preventDefault(); const sel = window.getSelection(); if (!sel?.rangeCount) return; const range = sel.getRangeAt(0);range.deleteContents(); const text = document.createTextNode('\n'); range.insertNode(text);range.setStartAfter(text);range.collapse(true);sel.removeAllRanges();sel.addRange(range);changed() }
 }
+defineExpose({ upload, pick, focus: () => editor.value?.focus() })
 </script>
 
 <template>
-  <section class="video-reference-editor nodrag nopan nowheel" @pointerdown.stop @mousedown.stop @click.stop @wheel.stop>
-    <div class="reference-actions">
+  <section class="video-reference-editor nowheel" :class="{ nodrag: !draggableBackground, nopan: !draggableBackground }" @pointerdown="onPointerStart" @mousedown="onPointerStart" @click.stop @wheel.stop>
+    <div v-if="!hideActions" class="reference-actions">
       <button type="button" :disabled="busy" @click="upload">＋ {{ uploading ? '上传中…' : '上传' }}</button>
       <button v-if="!audioOnly" type="button" :disabled="busy" @click="pick('image')">▧ 选图片</button>
-      <button type="button" :disabled="busy" @click="pick('audio')">♫ 选声音</button>
+      <button v-if="allowAudio !== false" type="button" :disabled="busy" @click="pick('audio')">♫ 选声音</button>
       <span class="limit">{{ audioOnly ? '' : `${imageIds.length} 图 · ` }}{{ audioIds.length }}/3 音频</span>
     </div>
-    <div class="reference-strip">
-      <div v-for="item in refs" :key="item.id" class="reference-tile" :class="item.kind" :title="item.filename">
+    <div v-if="!hideReferences" class="reference-strip" role="list" aria-label="参考素材，可拖拽排序">
+      <div v-for="item in refs" :key="item.id" class="reference-tile nodrag nopan" role="listitem" tabindex="0"
+        :draggable="!busy" :aria-label="`${item.label}，拖拽或按 Alt 加左右方向键排序`"
+        :class="[item.kind, { inactive: item.kind === 'audio' && allowAudio === false, 'ref-dragging': referenceSort.dragging.value === item.id, 'ref-drop-before': referenceSort.target.value === item.id && !referenceSort.after.value, 'ref-drop-after': referenceSort.target.value === item.id && referenceSort.after.value }]"
+        :title="`${item.filename} · 拖拽排序；Alt + ← / → 调整顺序`"
+        @dragstart.stop="referenceSort.start($event, item.id)" @dragover.stop="referenceSort.over($event, item.id)" @dragleave.stop="referenceSort.leave" @drop.stop="referenceSort.drop($event, item.id)" @dragend.stop="referenceSort.end" @keydown="referenceSort.key($event, item.id)">
         <button type="button" class="reference-preview" :aria-label="`${item.kind === 'audio' ? '试听' : '预览'} ${item.label}`" @click="preview(item.id, item.kind)">
-          <img v-if="item.kind === 'image' && urls[item.id]" :src="urls[item.id]" alt="" /><span v-else class="music">♫</span>
+          <img v-if="item.kind === 'image' && urls[item.id]" :src="urls[item.id]" :draggable="false" alt="" /><span v-else class="music">♫</span>
           <span class="reference-number">{{ item.number }}</span><span v-if="item.kind === 'audio'" class="reference-duration">{{ item.duration.toFixed(1) }}s</span>
         </button>
         <button type="button" class="reference-remove" :aria-label="`移除 ${item.label}`" :disabled="busy" @click="remove(item.id, item.kind)">×</button>
-        <button type="button" class="reference-insert" :title="item.filename" :disabled="busy || referencesOnly" @pointerdown.prevent @click="insert(item)">{{ item.label }}</button>
+        <button type="button" class="reference-insert" :title="item.filename" :disabled="busy || referencesOnly || (item.kind === 'audio' && allowAudio === false)" @pointerdown.prevent @click="insert(item)">{{ item.label }}</button>
       </div>
       <p v-if="!refs.length" class="reference-empty">{{ audioOnly ? '上传或选用参考声音' : '添加图片、声音，在提示词中指定各自的用途' }}</p>
     </div>
     <div v-if="activeAudio && urls[activeAudio]" class="audio-audition"><span>{{ refs.find(item => item.id === activeAudio)?.filename }}</span><audio :key="activeAudio" :src="urls[activeAudio]" controls autoplay preload="metadata" /></div>
     <template v-if="!referencesOnly">
-      <div ref="editor" class="reference-prompt" :contenteditable="!busy" role="textbox" aria-multiline="true" aria-label="视频提示词" data-placeholder="描述动作、镜头和声音；输入 @ 选择图片或音频参考…"
+      <div ref="editor" class="reference-prompt" :contenteditable="!busy" role="textbox" aria-multiline="true" aria-label="视频提示词" :data-placeholder="placeholder || '描述动作、镜头和声音；输入 @ 选择图片或音频参考…'"
         @input="changed" @blur="blur" @click="remember" @keyup="event => { if (!['ArrowDown','ArrowUp','Enter','Escape'].includes(event.key)) remember() }" @keydown="keydown" @copy="copy($event)" @cut="copy($event, true)" @paste="paste" @compositionstart="composing = true" @compositionend="composing = false; changed()" />
       <div v-if="menu && options.length" class="reference-menu" role="listbox" aria-label="选择图片或音频引用">
         <button v-for="(item, i) in options" :key="item.id" type="button" role="option" :aria-selected="i === menuIndex" :class="{ active: i === menuIndex }" @pointerdown.prevent @click="insert(item)"><img v-if="item.kind === 'image' && urls[item.id]" :src="urls[item.id]" alt="" /><span v-else>♫</span><b>{{ item.label }}</b><span>{{ item.filename }}</span></button>
       </div>
-      <p class="reference-tip">点击素材名称或输入 @ 插入引用标签；@数字 对应上方素材编号，图片和声音均可引用。</p>
+      <p v-if="!hideReferences" class="reference-tip">拖拽图片或声音调整顺序；点击名称或输入 @ 插入引用。已有标签跟随原素材，编号同步更新。</p>
     </template>
-    <p v-if="issue" class="reference-warning" role="alert">{{ issue }}</p>
-    <AssetPicker :open="pickerOpen" :kind="pickerKind" multiple show-library :title="pickerKind === 'audio' ? '选择参考声音（最多3条）' : '选择参考图片'" :selected-ids="[]" @close="pickerOpen = false" @confirm="ids => add(ids, pickerKind)" />
+    <p v-if="allowAudio === false && audioIds.length" class="reference-tip">参考声音已保留；此模式不提交声音，使用声音请切换到全能参考。</p>
+    <p v-if="issue && allowAudio !== false" class="reference-warning" role="alert">{{ issue }}</p>
+    <AssetPicker :open="pickerOpen" :kind="pickerKind" :default-tab="pickerTab" multiple show-library :title="pickerKind === 'audio' ? `选择${audioSync ? '驱动音频' : '参考声音'}（最多${maxAudios ?? 3}条）` : '选择参考图片'" :selected-ids="[]" @close="pickerOpen = false" @confirm="ids => add(ids, pickerKind)" />
   </section>
 </template>
 
 <style scoped>
+.reference-tile.inactive { opacity:.45; }
+.reference-tile[draggable="true"] { cursor:grab; }
+.reference-tile.ref-dragging { opacity:.4; }
+.reference-tile.ref-drop-before::before,.reference-tile.ref-drop-after::after { content:''; position:absolute; top:0; bottom:0; width:3px; background:var(--color-text-1); border-radius:2px; pointer-events:none; }
+.reference-tile.ref-drop-before::before { left:-5px; }
+.reference-tile.ref-drop-after::after { right:-5px; }
+.reference-tile:focus-visible { outline:2px solid var(--color-text-1); outline-offset:2px; }
 .video-reference-editor { width:100%; min-width:0; position:relative; color:var(--color-text-1); font-size:12px; }
 .reference-actions { display:flex; align-items:center; gap:5px; margin-bottom:8px; flex-wrap:wrap; }
 .reference-actions button { border:1px solid var(--color-border); background:var(--color-fill-hover); color:var(--color-text-2); border-radius:6px; padding:4px 7px; cursor:pointer; font:inherit; }

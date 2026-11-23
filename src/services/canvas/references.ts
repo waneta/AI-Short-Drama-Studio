@@ -36,13 +36,29 @@ export function canvasNodeProducesImage(node?: CanvasNode): boolean {
   )
 }
 
-/** 连线参考优先，其后是手工上传/资产库选择的参考图。 */
+/** Source keys preserve positions when connected nodes produce a new asset. */
+function canvasReferenceImages(project: Project, node: CanvasNode): Array<{ key: string; id: ID }> {
+  const entries: Array<{ key: string; id: ID }> = []
+  for (const sourceId of node.data.referenceSourceNodeIds ?? []) {
+    const id = canvasNodeOutputAssetId(project, project.canvas?.nodes.find(item => item.id === sourceId))
+    if (id) entries.push({ key: `node:${sourceId}`, id })
+  }
+  for (const id of node.data.referenceAssetIds ?? []) entries.push({ key: `asset:${id}`, id })
+  const order = node.data.referenceImageOrder ?? []
+  const rank = (key: string) => { const index = order.indexOf(key); return index < 0 ? order.length : index }
+  entries.sort((a, b) => rank(a.key) - rank(b.key))
+  const seen = new Set<ID>()
+  return entries.filter(item => { if (seen.has(item.id)) return false; seen.add(item.id); return true })
+}
+
+/** Without an explicit order, retain the original connected-then-manual behavior. */
 export function resolvedCanvasReferenceAssetIds(project: Project, node?: CanvasNode): ID[] {
-  if (!node) return []
-  const connected = (node.data.referenceSourceNodeIds ?? [])
-    .map((id) => canvasNodeOutputAssetId(project, project.canvas?.nodes.find((item) => item.id === id)))
-    .filter((id): id is ID => Boolean(id))
-  return [...new Set([...connected, ...(node.data.referenceAssetIds ?? [])])]
+  return node ? canvasReferenceImages(project, node).map(item => item.id) : []
+}
+
+export function canvasReferenceImageOrder(project: Project, node: CanvasNode, ids: ID[]): string[] {
+  const entries = canvasReferenceImages(project, node)
+  return [...new Set(ids)].map(id => entries.find(item => item.id === id)?.key).filter((key): key is string => Boolean(key))
 }
 
 /** 从自由节点拿掉一张参考图：手工添加的和连线带进来的都能删，连线一并断开。 */

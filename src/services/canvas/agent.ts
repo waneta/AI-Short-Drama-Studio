@@ -74,11 +74,13 @@ export interface AgentRunOptions {
   mode?: 'drama' | 'freeform'
   /** 当前在画布上选中的自由生成节点 */
   selectedNodeId?: string
+  /** Explicit batch from the director composer; only optimize these prompts. */
+  promptNodeIds?: string[]
   /** 用户在对话框附加的本地文件（文本内容已读入） */
   attachments?: AgentAttachment[]
 }
 
-const TOOLS_HINT = `你是剧流 Studio 画布上的现场助理。一边干活一边告诉用户画布上发生了什么。
+export const TOOLS_HINT = `你是剧流 Studio 画布上的现场助理。一边干活一边告诉用户画布上发生了什么。
 
 硬性规则：
 1. 只输出 JSON：{ "say": "给用户看的话", "actions": [ ... ], "done": false }。actions 是“下一小批”真实画布操作，不是一次性的建议清单；工具执行后你会重新看到最新画布并继续判断。确认用户目标已经落到画布上时返回 done=true、actions=[]。
@@ -245,7 +247,9 @@ export async function runAgentTurn(
   if (material) userText = `${material}\n\n${userText}`
   const hasPipeline = hasPipelineData(p0)
   // 意图分类全部由 LLM 完成（正式模式）；演示模式退回 detectIntent 规则兜底
-  const intent = await detectIntentSmart(
+  const intent: AgentIntent = options.promptNodeIds?.length
+    ? { kind: 'prompt_polish', label: '批量优化提示词', needsTools: true, confidence: 'high' }
+    : await detectIntentSmart(
     baseText,
     {
       hasPipeline,
@@ -319,14 +323,16 @@ export async function runAgentTurn(
     return answerQuestion(userText, history, p0, onEvent, options)
   }
   // 选中节点的提示词优化：快路径，不等规划
-  if (intent.kind === 'prompt_polish') {
-    const nodeId = options.selectedNodeId || findGenNodeInText(p0, baseText)
+  if (intent.kind === 'prompt_polish' || options.promptNodeIds?.length) {
+    const batchIds = [...new Set(options.promptNodeIds || [])].filter(id => p0.canvas?.nodes.some(n => n.id === id && ['imageGen', 'videoGen'].includes(n.type)))
+    const nodeId = batchIds[0] || options.selectedNodeId || findGenNodeInText(p0, baseText)
     if (nodeId) {
+      const nodeIds = batchIds.length ? batchIds : [nodeId]
       const plan0 = {
         say: '按你说的方向加厚这个节点的提示词，只补画面细节，不动原文格式。',
-        actions: [{ tool: 'optimize_node_prompt', nodeId, text: userText }]
+        actions: nodeIds.map(nodeId => ({ tool: 'optimize_node_prompt', nodeId, text: userText }))
       }
-      onEvent({ kind: 'plan', label: '计划 1 步：优化节点提示词', plan: buildPlanFromActions(plan0.actions as any, intent.label) })
+      onEvent({ kind: 'plan', label: `计划 ${nodeIds.length} 步：优化节点提示词`, plan: buildPlanFromActions(plan0.actions as any, intent.label) })
       onEvent({ kind: 'log', label: '开始在画布上干活' })
       const loop0 = await runAgentLoop(plan0.actions, {
         request: userText,
@@ -338,15 +344,15 @@ export async function runAgentTurn(
       if (loop0.stopped) {
         const failed = [...r0].reverse().find((r) => !r.ok)
         return {
-          reply: `提示词优化没成功。${failed ? `\n原因：${failed.detail}` : ''}`,
+          reply: `提示词优化已停止，完成 ${r0.filter(r => r.ok).length}/${nodeIds.length} 个节点。${failed ? `\n原因：${failed.detail}` : ''}`,
           results: r0,
           chips: [{ label: '重试', text: '再优化一次当前节点提示词' }]
         }
       }
       return {
-        reply: r0[0]?.detail || '提示词已加厚，写回节点了。',
+        reply: nodeIds.length > 1 ? `已优化 ${r0.filter(r => r.ok).length} 个节点的提示词，没有重新生成素材。\n\n${r0.map(r => r.detail).join('\n\n')}` : r0[0]?.detail || '提示词已加厚，写回节点了。',
         results: r0,
-        chips: [
+        chips: nodeIds.length > 1 ? [{ label: '看看画布进度', text: '现在画布什么情况' }] : [
           { label: '生成这个节点', text: `生成节点 ${nodeId}` },
           { label: '再厚一点', text: '继续加厚当前节点提示词，画面再具体一点' }
         ]
@@ -685,7 +691,7 @@ function statusNotes(p: Project): string {
   const gen = genNodeNotes(p)
   if (gen) parts.push(gen)
   if (!parts.length) {
-    return '**画布还是空的。** 直接在左边说一句话我就开工（例如「写一个修仙短剧，8 个分镜」），也可以在空白处右键手动添加图片 / 视频 / 剧本 / 角色 / 场景 / 分镜节点。'
+    return '**画布还是空的。** 点击底部 AI 助手，说一句话我就开工（例如「写一个修仙短剧，8 个分镜」），也可以在空白处右键手动添加图片 / 视频 / 剧本 / 角色 / 场景 / 分镜节点。'
   }
   return parts.join('\n\n')
 }
@@ -771,7 +777,7 @@ function capabilityNotes(p: Project): string {
 - 检查进度、补齐缺漏（说「全流程」会整条跑完）
 - 记住你的偏好（说「记住…」）
 
-两种用法都行：左边直接说一句话我一路做下去，也可以在画布空白处右键手动加节点自己拼。
+两种用法都行：在底部 AI 助手里说一句话，我一路做下去，也可以在画布空白处右键手动加节点自己拼。
 
 ${
   hasScript

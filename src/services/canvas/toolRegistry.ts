@@ -1060,7 +1060,10 @@ export function validateToolAction(raw: unknown): AgentToolAction {
     ...(typeof action.subjectId === 'string' ? { subjectId: action.subjectId } : {}),
     ...(typeof action.sceneId === 'string' ? { sceneId: action.sceneId } : {}),
     ...(typeof action.shotId === 'string' ? { shotId: action.shotId } : {}),
-    ...(typeof action.nodeId === 'string' ? { nodeId: action.nodeId } : {})
+    ...(typeof action.nodeId === 'string' ? { nodeId: action.nodeId } : {}),
+    ...(typeof action.sourceNodeId === 'string' ? { sourceNodeId: action.sourceNodeId } : {}),
+    ...(typeof action.targetNodeId === 'string' ? { targetNodeId: action.targetNodeId } : {}),
+    ...(typeof action.nodeLabel === 'string' ? { nodeLabel: action.nodeLabel } : {})
     ,...(typeof action.visualPrompt === 'string' ? { visualPrompt: action.visualPrompt } : {})
     ,...(typeof action.imagePrompt === 'string' ? { imagePrompt: action.imagePrompt } : {})
     ,...(typeof action.videoPrompt === 'string' ? { videoPrompt: action.videoPrompt } : {})
@@ -1161,3 +1164,6 @@ export function estimateRequestText(text: string): ToolEstimate {
   }
   return { calls, seconds }
 }
+
+/** Schema-independent registry catalog shared with the embedded Codex client. */
+export function registeredToolNames(): AgentToolName[] { return [...registry.keys()] }

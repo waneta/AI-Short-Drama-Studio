@@ -4,6 +4,7 @@ import type { ProviderPreset } from '@/services/ai/providers'
 import { applyProviderPreset, findProvider, matchProviderId } from '@/services/ai/providers'
 
 const props = defineProps<{
+  compact?: boolean
   title: string
   hint?: string
   presets: ProviderPreset[]
@@ -76,7 +77,7 @@ function onAdd() {
 </script>
 
 <template>
-  <section class="form">
+  <section class="form" :class="{ compact }">
     <header class="head">
       <h3>{{ title }}</h3>
       <p v-if="hint" class="hint">{{ hint }}</p>
@@ -86,7 +87,7 @@ function onAdd() {
     <select v-model="providerId">
       <option v-for="p in presets" :key="p.id" :value="p.id">{{ p.name }}</option>
     </select>
-    <p class="hint">大厂官方和中转站都在这里配置。选择预设会自动填写推荐地址；中转站请选择“自定义”。</p>
+    <p v-if="!compact" class="hint">大厂官方和中转站都在这里配置。选择预设会自动填写推荐地址；中转站请选择“自定义”。</p>
     <p class="hint">{{ currentPreset.hint }}</p>
 
     <label>Base URL（接口地址）</label>
@@ -109,7 +110,7 @@ function onAdd() {
     </div>
 
     <label>模型名称</label>
-    <p class="hint">
+    <p v-if="!compact" class="hint">
       点击模型即可设为当前使用。同一地址和 Key 支持多个模型时，也可以继续添加。
     </p>
     <div class="chips">
@@ -131,7 +132,7 @@ function onAdd() {
       </button>
       <span v-if="!models.length" class="hint">还没有模型</span>
     </div>
-    <div v-if="suggested.length" class="suggest">
+    <component :is="compact ? 'details' : 'div'" v-if="suggested.length" class="model-suggestions"><summary v-if="compact">添加推荐模型（{{ suggested.length }}）</summary><div class="suggest">
       <span>常用，点一下加入</span>
       <button
         v-for="m in suggested"
@@ -142,7 +143,7 @@ function onAdd() {
       >
         + {{ m }}
       </button>
-    </div>
+    </div></component>
 
     <label>添加模型名</label>
     <div class="add-row">
@@ -161,6 +162,8 @@ function onAdd() {
 </template>
 
 <style scoped>
+.form.compact{max-width:none}.compact .head h3{font-size:14px}.compact .model-suggestions summary{font-size:12px;color:var(--color-text-3);cursor:pointer;padding:6px 0}.compact .suggest{margin:0 0 6px}.compact input,.compact select{box-sizing:border-box}.compact label{margin-top:3px}
+
 .form {
   display: flex;
   flex-direction: column;

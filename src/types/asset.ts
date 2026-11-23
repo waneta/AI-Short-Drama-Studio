@@ -14,6 +14,10 @@ export type AssetKind = 'image' | 'video' | 'audio'
 
 export interface GenerationRecord {
   version: 1
+  /** Stable request identity, preserved when an output is copied into the shared library. */
+  runId?: string
+  outputCount?: number
+  simulated?: boolean
   kind: 'image' | 'video'
   createdAt: number
   /** Client elapsed time from submission to downloaded result, including uploads and queueing. */
@@ -31,6 +35,7 @@ export interface GenerationRecord {
   generationHeight?: number
   aspectRatio?: string
   resolution?: string
+  quality?: string
   style?: string
   seed?: number
   steps?: number
@@ -45,6 +50,8 @@ export interface GenerationRecord {
   duration?: number
   mode?: string
   audioEnabled?: boolean
+  /** Selected per-shot speech plan for this result, distinct from image/reference generation mode. */
+  shotAudioMode?: 'h3-dialogue' | 'h3-voiceover' | 'tts' | 'none'
   referenceCount?: number
   referenceAudio?: { assetId?: string; filename?: string }
   referenceAudios?: Array<{ assetId?: string; filename?: string }>
@@ -78,10 +85,13 @@ export interface AssetBase {
   library?: boolean
   /** 用户自建分类文件夹；空则在公共资产（未分类） */
   folderId?: string
+  /** Explicit labels, independent of folder membership. */
+  tags?: string[]
 }
 
 /** 公共资产库里的用户自建文件夹 */
 export interface LibraryFolder {
+  parentId?: ID
   id: ID
   name: string
   createdAt: number

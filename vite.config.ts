@@ -3,7 +3,10 @@ import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import path from 'node:path'
 import { readFileSync } from 'node:fs'
+import { codexBridge } from './scripts/codex-bridge'
 import { tokenPlanWebProxy } from './scripts/token-plan-proxy'
+import { autodlWebProxy } from './scripts/autodl-web-proxy'
+import { volcTtsWebProxy } from './scripts/volc-tts-web-proxy'
 
 /** Packaged builds must not inline this machine's .env keys or endpoints. */
 const packEnvDir = path.join(__dirname, 'scripts/pack-env')
@@ -65,6 +68,8 @@ export default defineConfig(async ({ command, mode }) => {
       'import.meta.env.VITE_COMFY_PROXY_TARGET': JSON.stringify(web ? comfyTarget.origin : ''),
       'import.meta.env.VITE_COMFY_REMOTE_IMAGE_PROXY_TARGET': JSON.stringify(web ? comfyRemoteImageTarget?.origin || '' : ''),
       'import.meta.env.VITE_COMFY_IMAGE_PROXY_TARGET': JSON.stringify(web ? comfyImageTarget?.origin || '' : ''),
+      'import.meta.env.VITE_AUTODL_WEB_PROXY': JSON.stringify(web ? 'true' : ''),
+      'import.meta.env.VITE_VOLC_TTS_WEB_PROXY': JSON.stringify(web ? 'true' : ''),
       'import.meta.env.VITE_TOKEN_PLAN_WEB_PROXY': JSON.stringify(web ? 'true' : ''),
       'import.meta.env.VITE_STARTUP_VIDEO_PROFILE': JSON.stringify(startupVideoProfile),
       'import.meta.env.VITE_STARTUP_IMAGE_PROFILE': JSON.stringify(startupImageProfile)
@@ -77,7 +82,7 @@ export default defineConfig(async ({ command, mode }) => {
     plugins: [
       stripMachineEnvOnPack(),
       vue(),
-      ...(web ? [tokenPlanWebProxy()] : []),
+      ...(web ? [tokenPlanWebProxy(), autodlWebProxy(), volcTtsWebProxy(), codexBridge()] : []),
       ...(web ? [] : [(await import('vite-plugin-electron/simple')).default({
         main: {
           entry: 'electron/main.ts',
@@ -121,8 +126,10 @@ export default defineConfig(async ({ command, mode }) => {
         'Cross-Origin-Embedder-Policy': 'require-corp'
       },
       fs: {
-        // 允许 serve public/ 目录
-        strict: false
+        deny: ['.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/juliu-codex-private/**'],
+        // Deny rules only apply with strict enabled. Keep private bridge files off HTTP.
+        strict: web,
+        allow: [__dirname]
       }
     },
     preview: {

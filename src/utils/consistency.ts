@@ -167,7 +167,7 @@ export function collectShotVideoEntries(shot: Shot, project: Project): VideoRefE
 }
 
 export function collectShotVideoRefIds(shot: Shot, project: Project): ShotRefBundle {
-  const entries = packVideoRefEntries(collectShotVideoEntries(shot, project))
+  const entries = packVideoRefEntries(collectShotVideoEntries(shot, project), 9, shotVideoNode(project, shot.id)?.data.videoReferenceOrder)
   return {
     ids: entries.map((entry) => entry.id),
     labels: entries.map((entry) => entry.label),
@@ -177,7 +177,11 @@ export function collectShotVideoRefIds(shot: Shot, project: Project): ShotRefBun
 }
 
 /** 最多 9 张。普通创作关键帧作为成片第一帧排在最前。 */
-export function packVideoRefEntries(entries: VideoRefEntry[], max = 9): VideoRefEntry[] {
+export function packVideoRefEntries(entries: VideoRefEntry[], max = 9, order: string[] = []): VideoRefEntry[] {
+  const ordered = (items: VideoRefEntry[]) => {
+    const rank = (id: string) => { const index = order.indexOf(id); return index < 0 ? order.length : index }
+    return items.sort((a, b) => rank(a.id) - rank(b.id))
+  }
   const chars = entries.filter((entry) => entry.kind === 'character')
   const extras = entries.filter((entry) => entry.kind === 'extra')
   const scene = entries.find((entry) => entry.kind === 'scene')
@@ -188,13 +192,13 @@ export function packVideoRefEntries(entries: VideoRefEntry[], max = 9): VideoRef
     const leftover = Math.max(0, max - reserved.length)
     const extraTake = Math.min(extras.length, leftover)
     const charTake = Math.max(0, leftover - extraTake)
-    return [keyframe, ...chars.slice(0, charTake), ...reserved.slice(1), ...extras.slice(0, extraTake)]
+    return ordered([keyframe, ...chars.slice(0, charTake), ...reserved.slice(1), ...extras.slice(0, extraTake)])
   }
   const reserved = [scene, board].filter((entry): entry is VideoRefEntry => Boolean(entry))
   const leftover = Math.max(0, max - reserved.length)
   const extraTake = Math.min(extras.length, leftover)
   const charTake = Math.max(0, leftover - extraTake)
-  return [...chars.slice(0, charTake), ...reserved, ...extras.slice(0, extraTake)]
+  return ordered([...chars.slice(0, charTake), ...reserved, ...extras.slice(0, extraTake)])
 }
 
 /**
@@ -406,7 +410,7 @@ export function boardRefSlots(shot: Shot, project: Project): ShotRefSlot[] {
 
 /** 视频节点展示实际提交 H3 的图：角色设计图、场景图、故事看板。 */
 export function videoRefSlots(shot: Shot, project: Project): ShotRefSlot[] {
-  return packVideoRefEntries(collectShotVideoEntries(shot, project)).map((entry, index) => ({
+  return packVideoRefEntries(collectShotVideoEntries(shot, project), 9, shotVideoNode(project, shot.id)?.data.videoReferenceOrder).map((entry, index) => ({
     id: entry.id,
     label:
       entry.kind === 'character'

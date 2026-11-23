@@ -1,7 +1,9 @@
 /** Native DashScope media protocols used by the Ubuntu cloud tutorial. */
+import { isWan3VideoModel, normalizeWan3VideoResolution, wan3VideoRatio } from './wan3VideoSettings'
 import { wan27ImageSizeIssue } from './wan27ImageSize'
 import { providerHttp } from './adapters'
 import { abortableDelay, throwIfAborted } from './abort'
+import { dashscopeReferenceMaxBytes, prepareDashscopeReferenceImage } from './dashscopeReferenceImage'
 
 type Endpoint = { baseUrl: string; apiKey: string; provider?: string }
 
@@ -11,6 +13,10 @@ export function isDashScopeEndpoint(ep: { baseUrl?: string; provider?: string })
     const host = new URL(ep.baseUrl || '').hostname
     return /^dashscope(?:-intl|-us)?\.aliyuncs\.com$/i.test(host) || host.endsWith('.maas.aliyuncs.com')
   } catch { return false }
+}
+
+export function isWan3VideoProfile(profile?: { workflowId?: string; provider?: string; baseUrl?: string; adapter?: { type?: string } }) {
+  return !!profile && isDashScopeEndpoint(profile) && !profile.adapter?.type && isWan3VideoModel(profile.workflowId)
 }
 
 function apiRoot(baseUrl: string): string {
@@ -53,7 +59,7 @@ async function download(url: string, kind: 'image' | 'video', signal?: AbortSign
 
 export async function dashscopeImage(ep: Endpoint & { model: string }, input: {
   prompt: string; width: number; height: number; aspectRatio?: string; referenceImages?: Blob[]; signal?: AbortSignal
-}) {
+}, onProgress?: (message: string) => void) {
   const refs = input.referenceImages || []
   const sizeIssue = wan27ImageSizeIssue(ep.model, input.width, input.height, refs.length)
   if (sizeIssue) throw new Error(sizeIssue)
@@ -70,7 +76,11 @@ export async function dashscopeImage(ep: Endpoint & { model: string }, input: {
   const sizes: Record<string, string> = { '16:9': '1664*928', '9:16': '928*1664', '1:1': '1328*1328', '4:3': '1472*1104' }
   const size = flexible ? `${input.width}*${input.height}` : sizes[input.aspectRatio || '16:9'] || '1664*928'
   const content: Array<{ image: string } | { text: string }> = []
-  for (const ref of refs) content.push({ image: await dataUrl(ref) })
+  for (const [index, ref] of refs.entries()) {
+    const prepared = await prepareDashscopeReferenceImage(ref, index + 1, input.signal, onProgress, dashscopeReferenceMaxBytes(ep.model))
+    content.push({ image: await dataUrl(prepared) })
+  }
+  throwIfAborted(input.signal)
   content.push({ text: input.prompt })
   const data = await jsonRequest(ep, '/services/aigc/multimodal-generation/generation', {
     model: ep.model, input: { messages: [{ role: 'user', content }] },
@@ -81,12 +91,14 @@ export async function dashscopeImage(ep: Endpoint & { model: string }, input: {
 }
 
 export async function dashscopeVideo(ep: Endpoint & { workflowId: string }, input: {
-  prompt: string; imageBlob?: Blob; referenceImages?: Blob[]; aspectRatio?: string; duration: number; signal?: AbortSignal;
+  prompt: string; imageBlob?: Blob; lastFrameBlob?: Blob; referenceImages?: Blob[]; aspectRatio?: string; duration: number; signal?: AbortSignal;
+  videoResolution?: import('@/types').VideoResolution; videoAspectAuto?: boolean;
+  videoGenerationMode?: import('@/types').VideoGenerationMode; h3GenMode?: 'reference' | 'fl2va';
   resumeTaskId?: string; onTaskSubmitted?: (id: string) => void | Promise<void>
 }, onProgress?: (message: string) => void) {
   const model = ep.workflowId
   const legacy = /^wan2\.6-(?:i2v(?:-flash)?|t2v)$/.test(model)
-  const wan3 = model === 'wan3.0-video'
+  const wan3 = isWan3VideoModel(model)
   const happy = /^happyhorse-1\.1-(?:i2v|t2v|r2v)$/.test(model)
   if (!legacy && !wan3 && !happy) throw new Error('[百炼] 当前原生适配支持万相 2.6、wan3.0-video 和 HappyHorse 1.1 系列')
   if (legacy && ![5, 10, 15].includes(input.duration)) throw new Error('[百炼] 此接入使用 5、10 或 15 秒镜头，请先调整时长')
@@ -94,6 +106,14 @@ export async function dashscopeVideo(ep: Endpoint & { workflowId: string }, inpu
   throwIfAborted(input.signal)
   let id = input.resumeTaskId
   if (!id) {
+    const firstLast = input.videoGenerationMode === 'first-last' || input.h3GenMode === 'fl2va'
+    if (firstLast) {
+      if (!wan3) throw new Error('[百炼] 当前模型不支持首尾帧，请切换到 Wan 3.0')
+      if (!input.imageBlob || !input.lastFrameBlob) throw new Error('[百炼] 首尾帧模式需要首帧和尾帧各一张图')
+      if (input.referenceImages?.length) throw new Error('[百炼] 首尾帧模式不能同时提交其他参考图，请切换图片参考模式或移除额外参考图')
+    } else if (input.lastFrameBlob) {
+      throw new Error('[百炼] 尾帧图片需要选择首尾帧模式，不能作为普通参考图提交')
+    }
     const i2v = model.includes('i2v')
     const r2v = model.endsWith('-r2v')
     if (i2v && !input.imageBlob) throw new Error('[百炼] 图生视频需要一张分镜首帧')
@@ -107,11 +127,13 @@ export async function dashscopeVideo(ep: Endpoint & { workflowId: string }, inpu
       if (i2v) requestInput.img_url = await dataUrl(input.imageBlob!)
       Object.assign(parameters, i2v ? { resolution: '720P' } : { size: '1280*720' }, { prompt_extend: false }, model.endsWith('-flash') ? { audio: false } : {})
     } else {
-      const media = wan3 ? refs : r2v ? refs : i2v ? [input.imageBlob!] : []
-      if (media.length) requestInput.media = await Promise.all(media.map(async blob => ({
-        type: r2v || (wan3 && (media.length > 1 || !input.imageBlob)) ? 'reference_image' : 'first_frame', url: await dataUrl(blob)
+      const media = firstLast ? [input.imageBlob!, input.lastFrameBlob!] : wan3 ? refs : r2v ? refs : i2v ? [input.imageBlob!] : []
+      if (media.length) requestInput.media = await Promise.all(media.map(async (blob, index) => ({
+        type: firstLast ? index === 0 ? 'first_frame' : 'last_frame'
+          : r2v || (wan3 && (input.videoGenerationMode === 'reference' || media.length > 1 || !input.imageBlob)) ? 'reference_image' : 'first_frame',
+        url: await dataUrl(blob)
       })))
-      Object.assign(parameters, { resolution: '720P' }, i2v ? {} : { ratio: wan3 && media.length === 1 && input.imageBlob ? 'adaptive' : ratio }, wan3 ? { prompt_extend: false } : {})
+      Object.assign(parameters, { resolution: wan3 ? normalizeWan3VideoResolution(input.videoResolution).toUpperCase() : '720P' }, i2v ? {} : { ratio: wan3 ? wan3VideoRatio(input.videoAspectAuto ? 'adaptive' : input.aspectRatio ?? (input.videoGenerationMode !== 'reference' && (firstLast || media.length === 1) && input.imageBlob ? 'adaptive' : undefined)) : ratio }, wan3 ? { prompt_extend: false } : {})
     }
     const data = await jsonRequest(ep, '/services/aigc/video-generation/video-synthesis', {
       model, input: requestInput, parameters

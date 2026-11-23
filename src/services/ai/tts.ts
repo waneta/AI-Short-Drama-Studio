@@ -11,6 +11,9 @@ import { getAIMode } from './client'
 import { spokenTextOnly } from './dialogue'
 import { getTtsConfig } from './runtime'
 import { providerHttp } from './adapters'
+import { isVolcTtsConfig, generateVolcSpeech } from './volcTts'
+import { TTS_VOICES, isVolcTtsModel, ttsVoicesForModel, ttsVoiceForModel } from './ttsVoices'
+import { controlledSignal, throwIfAborted } from './abort'
 
 export interface TTSInput {
   text: string
@@ -34,17 +37,7 @@ const log = (msg: string) =>
   console.log('%c[tts]', 'color:#06b6d4;font-weight:600', msg)
 
 /** 按对应模型选择系统音色；Qwen3-TTS 使用 Cherry。 */
-export const TTS_VOICES: { id: string; label: string }[] = [
-  { id: 'longanlingxin', label: '龙安灵心（女·TTS Plus）' },
-  { id: 'longanlufeng', label: '龙安鲁风（男·TTS Plus）' },
-  { id: 'Cherry', label: 'Cherry（Qwen3-TTS）' },
-  { id: 'longanhuan_v3.6', label: '龙安欢（女·自然普通话）' },
-  { id: 'longjielidou_v3.6', label: '龙杰力豆（男童）' },
-  { id: 'longpaopao_v3.6', label: '龙泡泡（女童）' },
-  { id: 'longhuohuo_v3.6', label: '龙火火（顽皮少年）' },
-  { id: 'longchuanshu_v3.6', label: '龙川叔（男）' },
-  { id: 'loongeva_v3.6', label: 'loongeva（女·美音）' }
-]
+export { TTS_VOICES } from './ttsVoices'
 
 /** 这些仍按缩写处理（可以逐字母或习惯读法） */
 const SPELL_ACRONYMS = new Set([
@@ -296,7 +289,8 @@ async function nativeQwen3Speech(
 }
 
 /** 模型和音色版本不匹配时，服务偶尔不报错但输出异常发音；这里改成稳定安全音色。 */
-export function compatibleVoice(model: string, requested?: string): string {
+export function compatibleVoice(model: string, requested?: string, fallback?: string): string {
+  if (isVolcTtsModel(model)) return ttsVoiceForModel(model, requested, fallback)
   const voice = (requested || '').trim()
   if (/^qwen-audio-3\.0-tts-plus/i.test(model)) {
     return ['longanlingxin', 'longanlufeng'].includes(voice) ? voice : 'longanlingxin'
@@ -354,7 +348,7 @@ export async function generateSpeech(input: TTSInput): Promise<TTSOutput> {
   if (!text) throw new Error('没有口播文案，无法配音')
 
   const cfg = ttsConfig()
-  const voice = compatibleVoice(cfg.model, input.voice || cfg.voice)
+  const voice = compatibleVoice(cfg.model, input.voice || cfg.voice, cfg.voice)
   const language = input.language || detectSpeechLanguage(text)
   log(`口播文本：${text.slice(0, 80)}${text.length > 80 ? '…' : ''}  lang=${language}`)
 
@@ -365,6 +359,15 @@ export async function generateSpeech(input: TTSInput): Promise<TTSOutput> {
     return { blob, mimeType: blob.type, model: 'mock-tts' }
   }
 
+  if (isVolcTtsConfig(cfg.baseUrl, cfg.model)) {
+    throwIfAborted(input.signal)
+    const ctl = controlledSignal(input.signal, 180_000)
+    try {
+      const blob = await generateVolcSpeech({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model,
+        text, voice, instruction: input.instruction, signal: ctl.signal })
+      return { blob, mimeType: blob.type, model: cfg.model }
+    } finally { ctl.cleanup() }
+  }
   const apiRoot = speechApiRoot(cfg.baseUrl)
   if (/^qwen3?-tts/i.test(cfg.model)) {
     const blob = await nativeQwen3Speech(apiRoot, cfg.apiKey, cfg.model, text, voice, language, input.signal)
@@ -417,5 +420,5 @@ export async function generateSpeech(input: TTSInput): Promise<TTSOutput> {
 
 /** Only show built-in voices accepted by the selected model family. */
 export function voicesForModel(model: string) {
-  return TTS_VOICES.filter(v => compatibleVoice(model, v.id) === v.id)
+  return ttsVoicesForModel(model).filter(v => compatibleVoice(model, v.id) === v.id)
 }

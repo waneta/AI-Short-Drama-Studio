@@ -20,6 +20,10 @@ export function aspectToSize(ar: AspectRatio): { width: number; height: number }
       return { width: 960, height: 720 }
     case '21:9':
       return { width: 1680, height: 720 }
+    default: {
+      const [w, h] = ar.split(':').map(Number)
+      return { width: Math.round(720 * w / Math.min(w, h) / 2) * 2, height: Math.round(720 * h / Math.min(w, h) / 2) * 2 }
+    }
   }
 }
 
@@ -28,9 +32,14 @@ export function aspectFrameHint(ar?: string): string {
   if (ar === '1:1') return '方形 1:1，宽高相等'
   if (ar === '4:3') return '横版 4:3'
   if (ar === '21:9') return '超宽影院 21:9'
+  if (ar && ar !== '16:9') {
+    const [w, h] = ar.split(':').map(Number)
+    if (w > 0 && h > 0) return `${w > h ? '横版' : w < h ? '竖版' : '方形'} ${ar}，严格保持画幅比例`
+  }
   return '横版 16:9 宽屏，宽大于高，禁止输出竖图'
 }
 
 export function isLandscapeAspect(ar?: string): boolean {
-  return ar === '16:9' || ar === '4:3' || ar === '21:9'
+  const [w, h] = String(ar || '').split(':').map(Number)
+  return w > h
 }

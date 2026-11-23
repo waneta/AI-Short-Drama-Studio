@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { runAgentTurn, type AgentEvent, type AgentMessage } from '@/services/canvas/agent'
+import { runAssistantTurn } from '@/services/assistant/codexEngine'
+import AssistantEngineSelect from './AssistantEngineSelect.vue'
+import CodexRunSelect from './CodexRunSelect.vue'
+import CodexChatHistory from './CodexChatHistory.vue'
+import { type AgentEvent, type AgentMessage } from '@/services/canvas/agent'
 import { friendlyAiError, isAbortError, isTimeoutAbort } from '@/services/ai/abort'
-import { appendAgentMessage, getAgentState, setAgentAutonomy } from '@/services/canvas/taskStore'
-import { estimateRequestText } from '@/services/canvas/toolRegistry'
+import { agentConversations, appendAgentMessage, getAgentState, renameAgentConversation, setAgentAutonomy, startAgentConversation, switchAgentConversation } from '@/services/canvas/taskStore'
+import { estimateRequestText, estimateToolActions } from '@/services/canvas/toolRegistry'
 import { onCanvasActivity, type CanvasActivity } from '@/services/canvas/canvasBridge'
 import { nextPipelineStep } from '@/services/canvas/pipeline'
-import { useProjectStore, useSettingsStore, useToastStore } from '@/stores'
+import { useAssetsStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
 import { desktop, isDesktop } from '@/services/desktop'
 import { autodlVideoProfileId } from '@/services/ai/runtime'
 import type { VideoGenModel } from '@/types'
@@ -16,26 +20,29 @@ import type { AgentAutonomy, AspectRatio, CanvasNode } from '@/types'
 import AgentMemoryPanel from './AgentMemoryPanel.vue'
 import AgentRichText from './AgentRichText.vue'
 import AgentTraceList from './AgentTraceList.vue'
+import AgentOrb from './AgentOrb.vue'
+import DirectorIcon from './DirectorIcon.vue'
+import { createReferencePickerScroll } from './referencePickerScroll'
 
 const props = withDefaults(
   defineProps<{
     selectedNode?: CanvasNode | null
+    active?: boolean
+    expanded?: boolean
+    docked?: boolean
   }>(),
-  { selectedNode: null }
+  { selectedNode: null, active: true }
 )
+
+const emit = defineEmits<{ close: []; expand: []; dock: []; activity: [busy: boolean] }>()
 
 type StepStatus = TraceStatus
 
 type FeedItem =
   | { id: string; type: 'msg'; role: 'user' | 'assistant'; content: string }
-  | { id: string; type: 'run'; rows: TraceRow[] }
+  | { id: string; type: 'run'; rows: TraceRow[]; durationMs?: number }
 
-const WELCOME =
-  '我是这张画布的创作搭档，两种用法都行：\n\n- **一句话开工**：说「写一个修仙短剧，8 个分镜」或「画一张黄昏的海边」，我直接建节点、写提示词、跑生成\n- **自己拼**：在画布空白处右键添加图片 / 视频 / 剧本 / 角色 / 场景 / 分镜，点选节点后让我改提示词、重跑\n\n我也带本地记忆——说「记住…」以后一直生效。想一次做到底就说「全流程」，否则我做一步停一步等你确认。'
-
-const feed = ref<FeedItem[]>([
-  { id: 'welcome', type: 'msg', role: 'assistant', content: WELCOME }
-])
+const feed = ref<FeedItem[]>([])
 const messages = computed<AgentMessage[]>(() =>
   feed.value
     .filter((item): item is Extract<FeedItem, { type: 'msg' }> => item.type === 'msg')
@@ -43,6 +50,17 @@ const messages = computed<AgentMessage[]>(() =>
 )
 const input = ref('')
 const busy = ref(false)
+const approval = ref<{ text: string; resolve: (accepted: boolean) => void } | null>(null)
+function requestToolApproval(text: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const signal = controller?.signal
+    const abort = () => { approval.value = null; resolve(false) }
+    const finish = (accepted: boolean) => { signal?.removeEventListener('abort', abort); approval.value = null; resolve(accepted) }
+    if (signal?.aborted) return resolve(false)
+    approval.value = { text, resolve: finish }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
 const thinking = ref(false)
 const log = ref('')
 const trace = ref<TraceRow[]>([])
@@ -52,25 +70,32 @@ const chips = ref<{ label: string; text: string }[]>([
   { label: '看看进度', text: '现在画布什么情况' }
 ])
 const box = ref<HTMLElement | null>(null)
+const messageScroll = createReferencePickerScroll(() => box.value, 72)
+const messagesReady = ref(false), followLatest = ref(true)
+const scrollPositions = new Map<string, { top: number; following: boolean }>()
+let scrollRevision = 0, lastMessageScrollTop = 0
 const autonomy = ref<AgentAutonomy>('gated')
 const modeOpen = ref(false)
 const memoryOpen = ref(false)
 const canvasLive = ref(false)
 const canvasTrace = ref<TraceRow[]>([])
 const project = useProjectStore()
+const assets = useAssetsStore()
 let offActivity: (() => void) | undefined
 const hoverMode = ref<AgentAutonomy | null>(null)
 const settings = useSettingsStore()
 const toast = useToastStore()
 /** 本轮要带上的本地文件附件（文本内容已在选择时读入） */
 const attachments = ref<AgentAttachment[]>([])
+const attachmentInput = ref<HTMLInputElement>()
+const composerInput = ref<HTMLTextAreaElement>()
 const TEXT_ATTACH_FILTERS = [
   { name: '文本文件', extensions: ['txt', 'md', 'markdown', 'fountain', 'srt', 'ass', 'lrc', 'json', 'csv'] }
 ]
 
 async function pickAttachments() {
   if (!isDesktop()) {
-    toast.warn('读取本地文件需要桌面端（已安装的应用）')
+    attachmentInput.value?.click()
     return
   }
   try {
@@ -93,6 +118,27 @@ async function pickAttachments() {
     toast.error('选择文件失败')
     console.warn('[agent] pickFiles 失败', e)
   }
+}
+
+async function addTextFiles(files: File[]) {
+  if (busy.value) return
+  const projectId = project.current?.id, sourceConversation = project.current?.agentState?.activeConversationId || 'legacy'
+  for (const file of files) {
+    if (!/\.(txt|md|markdown|fountain|srt|ass|lrc|json|csv)$/i.test(file.name)) { toast.warn(`「${file.name}」请先转为文本或 Markdown`); continue }
+    if (file.size > 5 * 1024 * 1024) { toast.warn(`「${file.name}」超过 5 MB，请缩小后上传`); continue }
+    const path = `browser:${file.name}:${file.size}:${file.lastModified}`
+    if (attachments.value.some(a => a.path === path)) continue
+    try {
+      const raw = await file.text()
+      if (project.current?.id !== projectId || (project.current?.agentState?.activeConversationId || 'legacy') !== sourceConversation) return
+      attachments.value.push({ name: file.name, path, content: raw.length > 200_000 ? `${raw.slice(0, 200_000)}\n【内容已截取前200,000字符】` : raw })
+    } catch { toast.error(`读取「${file.name}」失败`) }
+  }
+}
+
+async function onAttachmentFiles(event: Event) {
+  const el = event.target as HTMLInputElement
+  await addTextFiles(Array.from(el.files || [])); el.value = ''
 }
 
 function removeAttachment(index: number) {
@@ -143,6 +189,7 @@ const PANEL_WIDTH = 480
 const prefStyle = ref<Record<string, string>>({})
 
 function placePrefPanel() {
+  if (!prefOpen.value) return
   const rect = prefBtn.value?.getBoundingClientRect()
   if (!rect) return
   const vw = window.innerWidth
@@ -204,7 +251,7 @@ const activeVideoLabel = computed(() => {
 
 /** 比例小图标的内框尺寸（外框固定 40×26 居中） */
 function ratioBoxStyle(value: AspectRatio) {
-  const map: Record<AspectRatio, [number, number]> = {
+  const map: Partial<Record<AspectRatio, [number, number]>> = {
     '16:9': [30, 17],
     '9:16': [13, 23],
     '1:1': [19, 19],
@@ -282,7 +329,11 @@ const MODES: { id: AgentAutonomy; label: string; desc: string }[] = [
   }
 ]
 
-const estimate = computed(() => estimateRequestText(input.value))
+const estimate = computed(() => {
+  if (!batchPromptMode.value) return estimateRequestText(input.value)
+  const picked = references.value.filter(r => r.kind === 'node' && mediaNodes.value.some(n => n.id === r.id)).map(r => r.id)
+  return estimateToolActions((picked.length ? picked : mediaNodes.value.map(n => n.id)).map(nodeId => ({ tool: 'optimize_node_prompt', nodeId })))
+})
 const statusText = computed(() => {
   if (busy.value) {
     if (thinking.value) return '思考中'
@@ -292,6 +343,22 @@ const statusText = computed(() => {
   return currentMode.value.label
 })
 const statusLive = computed(() => busy.value || canvasLive.value)
+watch(statusLive, value => emit('activity', value), { immediate: true })
+watch(() => props.active, async active => {
+  if (!active) {
+    messageScroll.stop()
+    rememberScrollPosition()
+    modeOpen.value = false
+    genModeOpen.value = false
+    memoryOpen.value = false
+    conversationOpen.value = false
+    referenceOpen.value = false
+    closePrefPanel()
+  } else {
+    await restoreMessagePosition()
+    composerInput.value?.focus({ preventScroll: true })
+  }
+})
 
 /** 自由画布：当前选中节点卡片 */
 const selectedGenNode = computed(() => {
@@ -308,19 +375,179 @@ const polishChips = [
   { label: '按剧情对齐', text: '对照剧本，只写这一镜该发生的事，不改原文格式' }
 ]
 
-onMounted(() => {
+const welcome = computed(() => !feed.value.length && !statusLive.value)
+const conversationOpen = ref(false), changingConversation = ref(false)
+const conversations = computed(() => agentConversations(project.current?.agentState))
+const conversationId = computed(() => project.current?.agentState?.activeConversationId || 'legacy')
+const conversationTitle = computed(() => conversations.value.find(c => c.id === conversationId.value)?.title || '新对话')
+const codexMode = computed(() => settings.config.assistantEngine === 'codex')
+function savedCodexPage(): 'home' | 'chat' {
+  try { return localStorage.getItem(`juliu:codex-page:${project.current?.id}`) === 'chat' && getAgentState().messages.length ? 'chat' : 'home' } catch { return 'home' }
+}
+const codexPage = ref<'home' | 'chat'>(savedCodexPage())
+const codexHome = computed(() => codexMode.value && codexPage.value === 'home')
+const historyPanel = ref<InstanceType<typeof CodexChatHistory>>()
+const codexMore = ref<HTMLDetailsElement>(), codexAddOpen = ref(false)
+watch([conversationId, codexHome], () => messageScroll.stop())
+watch(codexPage, page => { try { localStorage.setItem(`juliu:codex-page:${project.current?.id}`, page) } catch {} })
+watch(codexMode, enabled => {
+  if (enabled) { saveSessionDraft(conversationId.value); codexPage.value = savedCodexPage(); if (codexHome.value) restoreSessionDraft('__new__') }
+  else { if (codexPage.value === 'home') { saveSessionDraft('__new__'); restoreSessionDraft(conversationId.value) }; restoreFeed() }
+  void restoreMessagePosition()
+})
+async function showCodexHome(fresh = false) {
+  if (statusLive.value || changingConversation.value) return
+  rememberScrollPosition(); saveSessionDraft(); codexPage.value = 'home'; conversationOpen.value = false
+  if (codexMore.value) codexMore.value.open = false
+  if (fresh) sessionDrafts.delete('__new__')
+  restoreSessionDraft('__new__'); referenceOpen.value = false; codexAddOpen.value = false
+  await nextTick(); composerInput.value?.focus()
+}
+async function renameCurrentCodexChat() {
+  await showCodexHome()
+  await nextTick(); await historyPanel.value?.rename(conversationId.value)
+}
+function closeCodexMore() { if (codexMore.value) codexMore.value.open = false }
+function workLabel(rows: TraceRow[], durationMs?: number) {
+  const failed = rows.some(row => row.status === 'fail')
+  const seconds = durationMs ? Math.max(1, Math.round(durationMs / 1000)) : 0
+  const duration = seconds ? (seconds < 60 ? `${seconds}秒` : `${Math.floor(seconds / 60)}分${seconds % 60}秒`) : ''
+  return `${failed ? '过程记录 · 有步骤失败' : '过程记录'}${duration ? ` · ${duration}` : ''}`
+}
+
+const renameId = ref(''), renameDraft = ref(''), renameError = ref(''), renameSaving = ref(false)
+async function beginConversationRename(id: string) {
+  if (statusLive.value || changingConversation.value || renameSaving.value) return
+  const conversation = conversations.value.find(c => c.id === id)
+  if (!conversation) return
+  renameId.value = id; renameDraft.value = conversation.title; renameError.value = ''
+  await nextTick()
+  const input = document.querySelector<HTMLInputElement>('.conversation-rename-form input')
+  input?.focus(); input?.select()
+}
+async function cancelConversationRename(focus = false) {
+  const id = renameId.value
+  renameId.value = ''; renameDraft.value = ''; renameError.value = ''
+  if (focus && id) {
+    await nextTick()
+    document.querySelector<HTMLButtonElement>(`[data-conversation-id="${CSS.escape(id)}"] .conversation-rename`)?.focus()
+  }
+}
+async function saveConversationName() {
+  if (!renameId.value || renameSaving.value || statusLive.value) return
+  if (!renameDraft.value.trim()) { renameError.value = '请输入对话名称'; return }
+  renameSaving.value = true; renameError.value = ''
+  try { await renameAgentConversation(renameId.value, renameDraft.value); await cancelConversationRename(true) }
+  catch (error: any) { renameError.value = error.message || '保存失败，请重试' }
+  finally { renameSaving.value = false }
+}
+watch([conversationOpen, () => project.current?.id, statusLive], ([open, projectId, live], [, oldProjectId]) => {
+  if (!open || live || projectId !== oldProjectId) void cancelConversationRename()
+})
+type DirectorReference = { key: string; id: string; kind: 'node' | 'asset'; label: string; detail: string }
+const references = ref<DirectorReference[]>([]), referenceOpen = ref(false), referenceSearch = ref(''), referenceIndex = ref(0)
+const referenceList = ref<HTMLElement | null>(null)
+const referenceScroll = createReferencePickerScroll(() => referenceList.value)
+watch([referenceOpen, referenceSearch], async () => {
+  referenceScroll.stop()
+  await nextTick()
+  if (referenceList.value) referenceList.value.scrollTop = 0
+})
+const batchPromptMode = ref(false)
+let mentionRange: { start: number; end: number } | undefined
+const availableReferences = computed<DirectorReference[]>(() => [
+  ...(project.current?.canvas?.nodes || []).map(n => ({ key: `node:${n.id}`, id: n.id, kind: 'node' as const, label: n.data.label || n.id, detail: n.type === 'groupFrame' ? '组合' : n.type === 'imageGen' ? '图片节点' : n.type === 'videoGen' ? '视频节点' : '流程节点' })),
+  ...assets.all.filter(a => a.projectId === project.current?.id).map(a => ({ key: `asset:${a.id}`, id: a.id, kind: 'asset' as const, label: a.filename || a.id, detail: a.kind === 'image' ? '图片资源' : a.kind === 'video' ? '视频资源' : '声音资源' }))
+])
+const filteredReferences = computed(() => availableReferences.value.filter(r => !references.value.some(p => p.key === r.key) && `${r.label} ${r.id} ${r.detail}`.toLowerCase().includes(referenceSearch.value.toLowerCase())).slice(0, 60))
+const mediaNodes = computed(() => (project.current?.canvas?.nodes || []).filter(n => ['imageGen', 'videoGen'].includes(n.type)))
+watch(referenceSearch, () => { referenceIndex.value = 0 })
+const sessionDrafts = new Map<string, { text: string; attachments: AgentAttachment[]; references: DirectorReference[]; batch: boolean }>()
+function saveSessionDraft(key = codexHome.value ? '__new__' : conversationId.value) { sessionDrafts.set(key, { text: input.value, attachments: [...attachments.value], references: [...references.value], batch: batchPromptMode.value }) }
+function restoreSessionDraft(key: string) {
+  const draft = sessionDrafts.get(key)
+  input.value = draft?.text || ''; attachments.value = draft?.attachments || []; references.value = draft?.references || []; batchPromptMode.value = draft?.batch || false
+}
+async function changeConversation(id?: string) {
+  if (statusLive.value || changingConversation.value) return
+  if (codexMode.value && !id) { await showCodexHome(true); return }
+  messageScroll.stop(); rememberScrollPosition(); messagesReady.value = false
+  changingConversation.value = true; conversationOpen.value = false; saveSessionDraft()
+  try {
+    if (id) await switchAgentConversation(id)
+    else await startAgentConversation()
+    if (codexMode.value) codexPage.value = 'chat'
+    restoreFeed()
+    restoreSessionDraft(conversationId.value)
+    referenceOpen.value = false; chips.value = []; trace.value = []; canvasTrace.value = []
+    await restoreMessagePosition(); composerInput.value?.focus({ preventScroll: true })
+  } catch { toast.error('切换对话失败，请稍后重试'); await restoreMessagePosition() }
+  finally { changingConversation.value = false }
+}
+function restoreFeed() {
   const saved = getAgentState()
   autonomy.value = saved.autonomy
-  if (saved.messages.length) {
-    feed.value = saved.messages
-      .filter((message) => message.role === 'user' || message.role === 'assistant')
-      .map((message, i) => ({
-        id: `saved-${i}`,
-        type: 'msg' as const,
-        role: message.role as 'user' | 'assistant',
-        content: message.content
-      }))
+  feed.value = saved.messages.filter(m => m.role === 'user' || m.role === 'assistant').map(m => ({ id: m.id, type: 'msg' as const, role: m.role as 'user' | 'assistant', content: m.content }))
+}
+function exportConversation() {
+  const content = `# ${conversationTitle.value}\n\n` + messages.value.map(m => `## ${m.role === 'user' ? '我' : '剧流 AI 导演'}\n\n${m.content}`).join('\n\n')
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/markdown;charset=utf-8' })), a = document.createElement('a')
+  a.href = url; a.download = `${conversationTitle.value.replace(/[\\/:*?"<>|]/g, '_')}.md`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+type CreativeIntent = 'canvas' | 'original' | 'adapt' | 'polish'
+const creativeIntents: { id: CreativeIntent; label: string; description: string; icon: string }[] = [
+  { id: 'canvas', label: '感知画布，接着创作', description: '梳理节点与参考关系，找到下一步', icon: 'canvas' },
+  { id: 'original', label: '从一个灵感开始原创', description: '把故事想法写成可拍摄的剧本', icon: 'script' },
+  { id: 'adapt', label: '上传故事，改编成剧本', description: '带上文本材料，保留故事的核心', icon: 'adapt' },
+  { id: 'polish', label: '批量优化画布提示词', description: '细化画面与镜头，不重新生成素材', icon: 'polish' }
+]
+async function useCreativeIntent(intent: CreativeIntent) {
+  if (busy.value) return
+  batchPromptMode.value = intent === 'polish'
+  if (intent === 'polish' && !mediaNodes.value.length) { batchPromptMode.value = false; toast.warn('先在画布添加图片或视频节点'); return }
+  const prompts: Record<CreativeIntent, string> = {
+    canvas: '请先查看当前画布的节点、连线和已有产物，概括当前进度，并建议下一步创作。先不要生成素材。',
+    original: '我想创作一个短剧。请先和我确认故事题材、主角、核心冲突、时长和画面风格，再一起打磨剧本。',
+    adapt: '请根据我上传的故事改编短剧剧本，先梳理人物、冲突和剧情主线，再和我确认改编方向。',
+    polish: '批量优化画布中图片和视频节点的提示词，补充构图、光影、动作与镜头细节，保持每个节点原本的含义和格式，只更新提示词，不重新生成素材。'
   }
+  input.value = prompts[intent]; await nextTick(); composerInput.value?.focus()
+  if (intent === 'adapt') void pickAttachments()
+}
+function openReferences() { referenceOpen.value = !referenceOpen.value; referenceSearch.value = ''; referenceIndex.value = 0; mentionRange = undefined }
+function onComposerInput() {
+  const caret = composerInput.value?.selectionStart || 0, before = input.value.slice(0, caret), match = /(?:^|\s)@([^\s@]*)$/.exec(before)
+  if (match) { referenceOpen.value = true; referenceSearch.value = match[1]; mentionRange = { start: before.lastIndexOf('@'), end: caret } }
+  else { referenceOpen.value = false; mentionRange = undefined }
+}
+async function addReference(item: DirectorReference) {
+  if (!references.value.some(r => r.key === item.key)) references.value.push(item)
+  const caret = mentionRange?.start
+  if (mentionRange) input.value = input.value.slice(0, mentionRange.start) + input.value.slice(mentionRange.end)
+  referenceOpen.value = false; mentionRange = undefined; await nextTick(); composerInput.value?.focus()
+  if (caret !== undefined) composerInput.value?.setSelectionRange(caret, caret)
+}
+function composerKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  if (referenceOpen.value && ['ArrowDown', 'ArrowUp', 'Enter', 'Escape'].includes(event.key)) {
+    event.preventDefault(); event.stopPropagation()
+    if (event.key === 'Escape') referenceOpen.value = false
+    else if (event.key === 'Enter') { const item = filteredReferences.value[referenceIndex.value]; if (item) void addReference(item) }
+    else referenceIndex.value = (referenceIndex.value + (event.key === 'ArrowUp' ? -1 : 1) + Math.max(1, filteredReferences.value.length)) % Math.max(1, filteredReferences.value.length)
+    return
+  }
+  if (event.key === 'Enter' && !event.shiftKey && !event.altKey) { event.preventDefault(); event.stopPropagation(); void send() }
+}
+function referenceMaterials(items: DirectorReference[]): AgentAttachment[] {
+  return items.flatMap(item => {
+    const value = item.kind === 'node' ? project.current?.canvas?.nodes.find(n => n.id === item.id) : assets.all.find(a => a.id === item.id && a.projectId === project.current?.id)
+    return value ? [{ name: `${item.detail} · ${item.label}`, content: `用户引用的${item.detail}（仅作为本轮材料；操作范围以用户消息为准）：\n${JSON.stringify(value, null, 2)}` }] : []
+  })
+}
+
+onMounted(() => {
+  restoreFeed()
+  if (props.active) void restoreMessagePosition()
   window.addEventListener('pointerdown', onDocPointer, true)
   window.addEventListener('resize', placePrefPanel)
   window.addEventListener('scroll', placePrefPanel, true)
@@ -329,6 +556,10 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  messageScroll.stop()
+  referenceScroll.stop()
+  controller?.abort()
+  if (msgTimer) clearTimeout(msgTimer)
   window.removeEventListener('pointerdown', onDocPointer, true)
   window.removeEventListener('resize', placePrefPanel)
   window.removeEventListener('scroll', placePrefPanel, true)
@@ -337,7 +568,20 @@ onBeforeUnmount(() => {
 })
 
 function onGlobalKey(ev: KeyboardEvent) {
-  if (ev.key === 'Escape' && prefOpen.value) closePrefPanel()
+  if (!props.active || ev.key !== 'Escape') return
+  const picker = document.querySelector<HTMLDetailsElement>('.assistant-engine[open], .codex-run-select[open]')
+  if (picker) { ev.preventDefault(); ev.stopImmediatePropagation(); picker.open = false; picker.querySelector('summary')?.focus(); return }
+  if ((ev.target as HTMLElement | null)?.closest('.codex-history')) return
+  if (codexMore.value?.open) { ev.preventDefault(); ev.stopImmediatePropagation(); closeCodexMore(); return }
+  if (codexAddOpen.value) { ev.preventDefault(); ev.stopImmediatePropagation(); codexAddOpen.value = false; return }
+  if (renameId.value) { ev.preventDefault(); ev.stopImmediatePropagation(); if (!renameSaving.value) void cancelConversationRename(true); return }
+  if (conversationOpen.value || referenceOpen.value) { conversationOpen.value = false; referenceOpen.value = false; ev.preventDefault(); ev.stopImmediatePropagation() }
+  else if (prefOpen.value) closePrefPanel()
+  else if (memoryOpen.value || modeOpen.value || genModeOpen.value) {
+    memoryOpen.value = false
+    modeOpen.value = false
+    genModeOpen.value = false
+  } else emit('close')
 }
 
 function onDocPointer(ev: PointerEvent) {
@@ -345,9 +589,14 @@ function onDocPointer(ev: PointerEvent) {
   const inPref = !!el && (!!el.closest('.pref-pop') || !!prefPanel.value?.contains(el))
   if (!el?.closest('.bar-pop') && !inPref) {
     modeOpen.value = false
+    genModeOpen.value = false
+    codexAddOpen.value = false
     closePrefPanel()
   }
   if (!el?.closest('.mem-pop')) memoryOpen.value = false
+  if (!el?.closest('.conversation-pop')) conversationOpen.value = false
+  if (!el?.closest('.codex-chat-more')) closeCodexMore()
+  if (!el?.closest('.reference-picker,.reference-trigger,textarea')) referenceOpen.value = false
 }
 
 async function chooseAutonomy(mode: AgentAutonomy) {
@@ -357,9 +606,61 @@ async function chooseAutonomy(mode: AgentAutonomy) {
   await setAgentAutonomy(mode)
 }
 
-async function scrollToEnd() {
+function rememberScrollPosition() {
+  const el = box.value
+  if (!messagesReady.value || !el?.clientHeight || codexHome.value) return
+  scrollPositions.set(conversationId.value, { top: el.scrollTop, following: followLatest.value })
+}
+function onMessagesWheel(event: WheelEvent) {
+  // Nested scrollable output (e.g. code blocks) keeps its own native scrolling.
+  let target = event.target instanceof Element ? event.target : null
+  while (target && target !== box.value) {
+    if (target instanceof HTMLElement && target.scrollHeight > target.clientHeight && /^(auto|scroll)$/.test(getComputedStyle(target).overflowY)) {
+      messageScroll.stop(); event.stopPropagation(); return
+    }
+    target = target.parentElement
+  }
+  // Leave follow mode before the first animated frame, even near the bottom.
+  if (!event.ctrlKey && !event.metaKey && !event.shiftKey && event.deltaY < 0 && Math.abs(event.deltaY) >= Math.abs(event.deltaX) && (box.value?.scrollTop || 0) > 0) {
+    followLatest.value = false
+    rememberScrollPosition()
+  }
+  messageScroll.onWheel(event)
+}
+function onMessagesScroll() {
+  const el = box.value
+  if (!messagesReady.value || !el?.clientHeight) return
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 64
+  // Layout changes can emit a delayed scroll event after new content arrives.
+  // Only upward movement leaves follow mode; our own positioning is recorded below.
+  if (el.scrollTop < lastMessageScrollTop - 1) followLatest.value = false
+  else if (nearBottom && el.scrollTop > lastMessageScrollTop) followLatest.value = true
+  lastMessageScrollTop = el.scrollTop
+  rememberScrollPosition()
+}
+async function restoreMessagePosition() {
+  messageScroll.stop()
+  const revision = ++scrollRevision, id = conversationId.value
+  messagesReady.value = false
   await nextTick()
-  box.value?.scrollTo({ top: box.value.scrollHeight, behavior: 'smooth' })
+  const el = box.value
+  if (revision !== scrollRevision || id !== conversationId.value || !props.active || codexHome.value || !el?.clientHeight) return
+  const saved = scrollPositions.get(id)
+  followLatest.value = saved?.following ?? true
+  el.scrollTo({ top: followLatest.value ? el.scrollHeight : saved!.top, behavior: 'instant' })
+  lastMessageScrollTop = el.scrollTop
+  messagesReady.value = true
+}
+async function scrollToEnd(force = false) {
+  const id = conversationId.value
+  if (force) { messageScroll.stop(); followLatest.value = true }
+  await nextTick()
+  const el = box.value
+  if (id !== conversationId.value || !props.active || codexHome.value || !el?.clientHeight || !followLatest.value || messageScroll.isScrolling()) return
+  el.scrollTo({ top: el.scrollHeight, behavior: 'instant' })
+  lastMessageScrollTop = el.scrollTop
+  messagesReady.value = true
+  rememberScrollPosition()
 }
 
 function upsertStep(key: string, patch: Partial<TraceRow>) {
@@ -491,14 +792,29 @@ async function finishCanvasRun(ev: CanvasActivity) {
 }
 
 async function sendText(text: string) {
-  const t = text.trim()
-  if (!t || busy.value) return
-  input.value = ''
-  const attachedNames = attachments.value.map((a) => a.name)
-  const display = attachedNames.length ? `${t}\n\n📎 ${attachedNames.join('、')}` : t
-  const attachOptions = attachments.value.slice()
+  const t = text.trim(), projectId = project.current?.id
+  if (!t || busy.value || changingConversation.value || !projectId) return
+  if (codexHome.value) {
+    if (statusLive.value) return
+    changingConversation.value = true
+    try {
+      await startAgentConversation()
+      if (project.current?.id !== projectId) return
+      codexPage.value = 'chat'; restoreFeed(); followLatest.value = true; sessionDrafts.delete('__new__')
+    } catch { toast.error('创建对话失败，请重试'); return }
+    finally { changingConversation.value = false }
+  }
+  const turnStarted = Date.now()
+  const savedAttachments = [...attachments.value], savedReferences = [...references.value]
+  const isBatch = batchPromptMode.value && text === input.value
+  const explicitNodes = savedReferences.filter(r => r.kind === 'node' && mediaNodes.value.some(n => n.id === r.id)).map(r => r.id)
+  const promptNodeIds = isBatch ? (explicitNodes.length ? explicitNodes : mediaNodes.value.map(n => n.id)) : undefined
+  const selectedNodeId = isBatch ? undefined : explicitNodes.length === 1 ? explicitNodes[0] : savedReferences.length ? undefined : selectedGenNode.value?.id
+  input.value = ''; referenceOpen.value = false; references.value = []; batchPromptMode.value = false
+  const attachedNames = savedAttachments.map(a => a.name)
+  const display = t + (attachedNames.length ? `\n\n📎 ${attachedNames.join('、')}` : '') + (savedReferences.length ? `\n\n引用：${savedReferences.map(r => r.label).join('、')}` : '')
+  const attachOptions = [...savedAttachments, ...referenceMaterials(savedReferences)]
   feed.value.push({ id: `u-${Date.now()}`, type: 'msg', role: 'user', content: display })
-  await appendAgentMessage('user', t)
   attachments.value = []
   busy.value = true
   thinking.value = true
@@ -507,14 +823,18 @@ async function sendText(text: string) {
   chips.value = []
   const turnController = new AbortController()
   controller = turnController
-  await scrollToEnd()
+  await scrollToEnd(true)
   try {
-    const result = await runAgentTurn(messages.value, t, onProgress, {
+    await appendAgentMessage('user', display)
+    const result = await runAssistantTurn(messages.value, t, event => { if (project.current?.id === projectId) onProgress(event) }, {
       signal: turnController.signal,
       autonomy: autonomy.value,
-      selectedNodeId: selectedGenNode.value?.id,
-      attachments: attachOptions
+      selectedNodeId,
+      promptNodeIds,
+      attachments: attachOptions,
+      approve: requestToolApproval
     })
+    if (project.current?.id !== projectId) return
     thinking.value = false
     const think = trace.value.find((s) => s.kind === 'think' && s.status === 'running')
     if (think) think.status = 'done'
@@ -526,14 +846,17 @@ async function sendText(text: string) {
       }
     }
     if (trace.value.length) {
-      feed.value.push({ id: `run-${Date.now()}`, type: 'run', rows: trace.value.map((row) => ({ ...row, plan: row.plan ? { ...row.plan, steps: row.plan.steps.map((s) => ({ ...s })) } : undefined })) })
+      feed.value.push({ id: `run-${Date.now()}`, type: 'run', durationMs: Date.now() - turnStarted, rows: trace.value.map((row) => ({ ...row, plan: row.plan ? { ...row.plan, steps: row.plan.steps.map((s) => ({ ...s })) } : undefined })) })
     }
     feed.value.push({ id: `a-${Date.now()}`, type: 'msg', role: 'assistant', content: result.reply })
     await appendAgentMessage('assistant', result.reply)
     chips.value = result.chips
   } catch (e: any) {
+    if (project.current?.id !== projectId) return
     thinking.value = false
-    attachments.value = attachOptions
+    attachments.value = savedAttachments
+    references.value = savedReferences
+    batchPromptMode.value = isBatch
     const cancelled = turnController.signal.aborted || (isAbortError(e) && !isTimeoutAbort(e))
     const content = cancelled
       ? '已停止。已完成的产物会保留，未开始的步骤不会继续。'
@@ -589,192 +912,48 @@ function visibleRows(rows: TraceRow[]) {
 </script>
 
 <template>
-  <aside class="agent">
+  <aside class="agent director" :class="{ 'is-welcome': welcome, 'codex-layout': codexMode, 'codex-home': codexHome }" :data-codex-view="codexMode ? codexPage : undefined">
     <header class="head">
-      <div class="head-id">
-        <span class="avatar" :class="{ live: statusLive }"><i /></span>
-        <div class="head-txt">
-          <strong>智能体</strong>
-          <span class="sub" :class="{ live: statusLive }">{{ statusText }}</span>
-        </div>
+      <div v-if="codexMode" class="codex-nav">
+        <button v-if="!codexHome" type="button" class="head-btn codex-back" aria-label="返回会话列表" :disabled="statusLive || changingConversation" @click="showCodexHome()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6-6 6 6 6M4 12h16" /></svg></button>
+        <h2 :title="codexHome ? '当前项目的会话' : conversationTitle">{{ codexHome ? '会话' : conversationTitle }}</h2>
       </div>
-      <div class="mem-pop">
-        <button
-          type="button"
-          class="head-btn"
-          :class="{ on: memoryOpen }"
-          title="本地记忆"
-          @click.stop="memoryOpen = !memoryOpen"
-        >
-          <svg viewBox="0 0 24 24">
-            <path d="M12 4a4 4 0 0 1 4 4c1.8.6 3 2.2 3 4.2A4.3 4.3 0 0 1 14.7 16H9.3A4.3 4.3 0 0 1 5 12.2c0-2 1.2-3.6 3-4.2a4 4 0 0 1 4-4z" />
-            <path d="M9 16v2.5M15 16v2.5M12 16V20" />
-          </svg>
+      <div v-else class="conversation-pop head-id">
+        <button class="conversation-toggle" type="button" :disabled="statusLive || changingConversation" :aria-expanded="conversationOpen" aria-label="切换对话" @click="conversationOpen = !conversationOpen">
+          <span>{{ conversationTitle }}</span><DirectorIcon name="chevron" :size="13" />
         </button>
-        <AgentMemoryPanel v-if="memoryOpen" @close="memoryOpen = false" />
-      </div>
-    </header>
-
-    <section class="target" :class="{ empty: !selectedGenNode }">
-      <p class="k">当前选中</p>
-      <p v-if="selectedGenNode" class="name">
-        {{ selectedGenNode.data.label || selectedGenNode.id }}
-        <small>{{ selectedKindLabel }}</small>
-      </p>
-      <p v-else class="name dim">还没选节点。点画布上的图片或视频节点，我来改它的提示词。</p>
-      <p v-if="selectedGenNode?.data.prompt" class="preview">{{ selectedGenNode.data.prompt }}</p>
-      <div v-if="selectedGenNode && !busy" class="target-chips">
-        <button v-for="c in polishChips" :key="c.label" type="button" @click="sendText(c.text)">
-          {{ c.label }}
-        </button>
-      </div>
-    </section>
-
-    <div ref="box" class="msgs">
-      <template v-for="item in feed" :key="item.id">
-        <div v-if="item.type === 'msg'" class="msg" :class="item.role">
-          <span v-if="item.role === 'assistant'" class="msg-avatar"><i /></span>
-          <div class="bubble">
-            <AgentRichText :content="item.content" />
-            <button
-              v-if="item.role === 'assistant'"
-              type="button"
-              class="bubble-copy"
-              :class="{ ok: copiedMsg === item.id }"
-              :title="copiedMsg === item.id ? '已复制' : '复制这条回复'"
-              @click="copyMsg(item.id, item.content)"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="9" y="9" width="11" height="11" rx="2" />
-                <path d="M5 15V5a2 2 0 0 1 2-2h8" />
-              </svg>
-            </button>
+        <span v-if="statusLive" class="director-status" role="status"><i />{{ statusText }}</span>
+        <span v-else-if="settings.config.assistantEngine === 'codex'" class="context-note" title="重新打开本项目后可接着聊，需要时助手会检索更早的记录。">项目对话持续保存</span>
+        <div v-if="conversationOpen" class="conversation-menu" role="menu" aria-label="项目对话记录">
+          <button type="button" class="new-conversation-row" role="menuitem" :disabled="statusLive || changingConversation || renameSaving" @click="changeConversation()"><DirectorIcon name="add" />新对话</button>
+          <p>当前项目的对话</p>
+          <div v-for="conversation in conversations" :key="conversation.id" class="conversation-entry" :data-conversation-id="conversation.id" :class="{ current: conversation.id === conversationId }">
+            <form v-if="renameId === conversation.id" class="conversation-rename-form" @submit.prevent="saveConversationName">
+              <input v-model="renameDraft" aria-label="对话名称" maxlength="60" :disabled="renameSaving" autocomplete="off" @input="renameError = ''" @keydown.enter.prevent="!$event.isComposing && saveConversationName()" />
+              <div class="rename-actions"><span v-if="renameError" class="rename-error" role="alert">{{ renameError }}</span><button type="button" :disabled="renameSaving" @click="cancelConversationRename(true)">取消</button><button type="submit" :disabled="renameSaving">{{ renameSaving ? '保存中…' : '保存' }}</button></div>
+            </form>
+            <template v-else>
+              <button type="button" class="conversation-select" role="menuitemradio" :aria-checked="conversation.id === conversationId" :disabled="statusLive || changingConversation || renameSaving" @click="changeConversation(conversation.id)"><span :title="conversation.title">{{ conversation.title }}</span><small>{{ conversation.messages.length }} 条</small></button>
+              <button type="button" class="conversation-rename" :aria-label="`重命名对话 ${conversation.title}`" title="重命名" :disabled="statusLive || changingConversation || renameSaving" @click="beginConversationRename(conversation.id)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5 4 4M4 20l2-6L17 3l4 4L10 18z" /></svg></button>
+            </template>
           </div>
         </div>
-        <div v-else class="turn">
-          <AgentTraceList :rows="visibleRows(item.rows)" />
-        </div>
-      </template>
-
-      <div v-if="canvasLive && canvasTrace.length" class="turn">
-        <AgentTraceList :rows="canvasTrace" />
       </div>
-
-      <div v-if="busy" class="turn">
-        <div v-if="thinking" class="think">
-          <span class="dot-pulse"><i /><i /><i /></span>
-          <span>思考中</span>
-        </div>
-        <AgentTraceList :rows="visibleRows(trace)" />
-      </div>
-    </div>
-
-    <div v-if="chips.length && !busy && !canvasLive" class="chips">
-      <button v-for="c in chips" :key="c.text + c.label" type="button" @click="sendText(c.text)">
-        {{ c.label }}
-      </button>
-    </div>
-
-    <form class="composer" @submit.prevent="send">
-      <p v-if="input.trim() && estimate.calls" class="estimate">
-        预计 {{ estimate.calls }} 次调用 · 约 {{ Math.max(1, Math.ceil(estimate.seconds / 60)) }} 分钟
-      </p>
-      <div class="box" :class="{ busy }">
-        <div v-if="attachments.length" class="attach-chips">
-          <span v-for="(a, i) in attachments" :key="a.path || a.name" class="attach-chip">
-            📎 {{ a.name }}
-            <button type="button" :disabled="busy" title="移除附件" @click="removeAttachment(i)">×</button>
-          </span>
-        </div>
-        <textarea
-          v-model="input"
-          rows="5"
-          :disabled="busy"
-          placeholder="说一句话就行，例如：写一个修仙短剧并出 8 个分镜 / 画一张黄昏的海边 / 把第 3 镜改成手持跟拍"
-          @keydown.enter.exact.prevent="send"
-        />
-        <div class="bar">
-          <div class="bar-pop">
-            <button
-              type="button"
-              class="bar-btn attach-btn"
-              :disabled="busy"
-              title="附加本地文件（txt / md / 剧本等文本），或直接在消息里写文件路径"
-              @click.stop="pickAttachments"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M21 12.5l-8.2 8.2a5.6 5.6 0 0 1-7.9-7.9L13 4.7a3.8 3.8 0 0 1 5.4 5.4l-8.1 8.1a1.9 1.9 0 0 1-2.7-2.7l7.5-7.5" />
-              </svg>
-              <span>附件</span>
-            </button>
-          </div>
-          <div class="bar-pop">
-            <button
-              type="button"
-              class="bar-btn"
-              :disabled="busy"
-              title="出片生成模式：自动按参考图；首尾帧链取上一镜末帧保证镜头连续"
-              @click.stop="genModeOpen = !genModeOpen; modeOpen = false"
-            >
-              生成模式 · {{ shotChainMode === 'fl2va' ? '首尾帧' : '自动' }}
-              <i />
-            </button>
-            <div v-if="genModeOpen" class="menu" @click.stop>
-              <button
-                type="button"
-                :class="{ on: shotChainMode === 'auto' }"
-                @click="chooseShotChainMode('auto')"
-              >
-                自动模式
-              </button>
-              <button
-                type="button"
-                :class="{ on: shotChainMode === 'fl2va' }"
-                @click="chooseShotChainMode('fl2va')"
-              >
-                首尾帧模式
-              </button>
-              <p class="tip">
-                {{
-                  shotChainMode === 'fl2va'
-                    ? '首尾帧链：第 1 镜用本镜配图起手；第 2 镜起自动截取上一镜视频的最后一帧作首帧，下一镜的配图作尾帧，镜头间画面连续。因为下一镜要等上一镜出片，批量出片会自动改成按镜号串行（一次一镜）。凑不齐首尾帧的镜头会自动退回常规出片，不会卡住生成。'
-                    : '每镜按自己的参考图 / 关键帧出片（默认）。想要镜头之间画面连续就选首尾帧模式。'
-                }}
-              </p>
-            </div>
-          </div>
-          <div class="bar-pop">
-            <button
-              type="button"
-              class="bar-btn"
-              :disabled="busy"
-              :title="currentMode.desc"
-              @click.stop="modeOpen = !modeOpen; prefOpen = false"
-            >
-              {{ currentMode.label }}
-              <i />
-            </button>
-            <div v-if="modeOpen" class="menu" @click.stop>
-              <button
-                v-for="m in MODES"
-                :key="m.id"
-                type="button"
-                :class="{ on: autonomy === m.id }"
-                @mouseenter="hoverMode = m.id"
-                @mouseleave="hoverMode = null"
-                @click="chooseAutonomy(m.id)"
-              >
-                {{ m.label }}
-              </button>
-              <p class="tip">{{ modeTip }}</p>
-            </div>
-          </div>
-          <div class="bar-pop pref-pop">
+      <div class="head-actions">
+        <AssistantEngineSelect :active="active" :disabled="busy || statusLive || changingConversation" />
+        <details v-if="codexMode && !codexHome" ref="codexMore" class="codex-chat-more">
+          <summary class="head-btn" aria-label="会话操作"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></summary>
+          <div class="codex-more-menu"><button type="button" :disabled="statusLive" @click="renameCurrentCodexChat">重命名</button><button type="button" :disabled="busy || !messages.length" @click="exportConversation(); closeCodexMore()">导出对话</button><button type="button" @click="memoryOpen = true; closeCodexMore()">本地记忆</button></div>
+        </details>
+        <button v-if="codexMode && !codexHome" class="head-btn" type="button" aria-label="查看会话历史" :disabled="statusLive || changingConversation" @click="showCodexHome()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8a8 8 0 1 1-1 7M4 3v5h5M12 7v5l3 2" /></svg></button>
+        <button class="head-btn new-conversation" type="button" :disabled="statusLive || changingConversation" title="新对话" aria-label="新对话" @click="changeConversation()"><svg v-if="codexMode" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-7M14 5l4 4M10 16l1-5L19 3l3 3-8 9z" /></svg><DirectorIcon v-else name="add" /></button>
+        <button v-if="!codexMode" class="head-btn" type="button" :disabled="!messages.length || busy" title="导出当前对话" aria-label="导出当前对话" @click="exportConversation"><DirectorIcon name="export" /></button>
+          <div class="head-pref pref-pop">
             <button
               ref="prefBtn"
               type="button"
-              class="bar-btn pref-btn"
-              :disabled="busy"
+              class="head-btn pref-btn" aria-label="创作偏好"
+              :disabled="busy || changingConversation"
               :title="`创作偏好：比例 ${currentAspectRatio} · 图像 ${activeImageLabel} · 视频 ${activeVideoLabel}`"
               @click.stop="togglePrefPanel"
             >
@@ -783,7 +962,7 @@ function visibleRows(rows: TraceRow[]) {
                 <circle cx="16" cy="8" r="2.2" />
                 <circle cx="8" cy="16" r="2.2" />
               </svg>
-              <span>创作偏好</span>
+              <span class="sr-only">创作偏好</span>
             </button>
             <Teleport to="body">
               <div
@@ -889,6 +1068,212 @@ function visibleRows(rows: TraceRow[]) {
               </div>
             </Teleport>
           </div>
+        <div class="mem-pop">
+          <button
+            type="button"
+            v-if="!codexMode" class="head-btn"
+            :class="{ on: memoryOpen }"
+            title="本地记忆" aria-label="本地记忆"
+            @click.stop="memoryOpen = !memoryOpen"
+          >
+            <svg viewBox="0 0 24 24">
+              <path d="M12 4a4 4 0 0 1 4 4c1.8.6 3 2.2 3 4.2A4.3 4.3 0 0 1 14.7 16H9.3A4.3 4.3 0 0 1 5 12.2c0-2 1.2-3.6 3-4.2a4 4 0 0 1 4-4z" />
+              <path d="M9 16v2.5M15 16v2.5M12 16V20" />
+            </svg>
+          </button>
+          <AgentMemoryPanel v-if="memoryOpen" @close="memoryOpen = false" />
+        </div>
+        <button class="head-btn dock-agent" type="button" :title="docked ? '切回浮动窗口' : '停靠到右侧'" :aria-label="docked ? '切回浮动窗口' : '停靠到右侧'" :aria-pressed="!!docked" @click="emit('dock')"><DirectorIcon :name="docked ? 'undock' : 'dock'" /></button>
+        <button type="button" class="head-btn minimize-btn" title="收起 AI 助手" aria-label="收起 AI 助手" @click="emit('close')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /></svg></button>
+      </div>
+    </header>
+
+    <section v-if="selectedGenNode && !codexHome" class="target">
+      <p class="k">当前选中</p>
+      <p v-if="selectedGenNode" class="name">
+        {{ selectedGenNode.data.label || selectedGenNode.id }}
+        <small>{{ selectedKindLabel }}</small>
+      </p>
+      <p v-else class="name dim">还没选节点。点画布上的图片或视频节点，我来改它的提示词。</p>
+      <p v-if="selectedGenNode?.data.prompt" class="preview">{{ selectedGenNode.data.prompt }}</p>
+      <div v-if="selectedGenNode && !busy" class="target-chips">
+        <button v-for="c in polishChips" :key="c.label" type="button" @click="sendText(c.text)">
+          {{ c.label }}
+        </button>
+      </div>
+    </section>
+
+    <div v-if="approval" class="tool-approval" role="alertdialog" aria-label="确认助手操作">
+      <p>{{ approval.text }}</p>
+      <button type="button" @click="approval?.resolve(true)">允许本步</button>
+      <button type="button" @click="approval?.resolve(false)">拒绝</button>
+    </div>
+    <CodexChatHistory v-if="codexHome" ref="historyPanel" :key="project.current?.id" :conversations="conversations" :active-id="conversationId" :disabled="statusLive || changingConversation" @open="changeConversation" />
+    <div v-show="!codexHome" ref="box" class="msgs" :class="{ 'welcome-scroll': welcome, positioning: !messagesReady }" aria-live="polite" :aria-busy="busy || !messagesReady" @scroll="onMessagesScroll" @wheel="onMessagesWheel" @pointerdown="messageScroll.stop" @keydown="messageScroll.stop">
+      <section v-if="welcome && !codexMode" class="director-welcome" aria-label="AI 创作起点">
+        <div class="welcome-identity"><AgentOrb :size="50" :paused="!active" /><h2>让 <strong>剧流 AI 导演</strong><br />接住你的每一个灵感</h2><p>从故事到画面，一起把创意变成作品</p></div>
+        <div class="welcome-actions"><button v-for="intent in creativeIntents" :key="intent.id" type="button" :data-creative-intent="intent.id" @click="useCreativeIntent(intent.id)"><DirectorIcon :name="intent.icon" :size="18" /><span><b>{{ intent.label }}</b><small>{{ intent.description }}</small></span><DirectorIcon name="arrow" :size="15" /></button></div>
+      </section>
+      <template v-for="item in feed" :key="item.id">
+        <div v-if="item.type === 'msg'" class="msg" :class="item.role">
+          <AgentOrb v-if="item.role === 'assistant' && !codexMode" class="msg-orb" :size="22" :paused="true" />
+          <div class="bubble">
+            <AgentRichText :content="item.content" />
+            <button
+              v-if="item.role === 'assistant'"
+              type="button"
+              class="bubble-copy"
+              :class="{ ok: copiedMsg === item.id }"
+              :title="copiedMsg === item.id ? '已复制' : '复制这条回复'"
+              @click="copyMsg(item.id, item.content)"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" />
+                <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div v-else class="turn">
+          <details v-if="codexMode" class="codex-work"><summary>{{ workLabel(item.rows, item.durationMs) }}<DirectorIcon name="chevron" :size="12" /></summary><AgentTraceList :rows="visibleRows(item.rows)" /></details>
+          <AgentTraceList v-else :rows="visibleRows(item.rows)" />
+        </div>
+      </template>
+
+      <div v-if="canvasLive && canvasTrace.length" class="turn">
+        <AgentTraceList :rows="canvasTrace" />
+      </div>
+
+      <div v-if="busy" class="turn">
+        <div v-if="thinking" class="think">
+          <span class="dot-pulse"><i /><i /><i /></span>
+          <span>思考中</span>
+        </div>
+        <AgentTraceList :rows="visibleRows(trace)" />
+      </div>
+    </div>
+
+    <div v-if="!codexHome && messagesReady && !followLatest" class="latest-shortcut"><button type="button" aria-label="回到最新消息" @click="scrollToEnd(true)">↓ 回到最新</button></div>
+    <div v-if="!codexHome && !welcome && chips.length && !busy && !canvasLive" class="chips">
+      <button v-for="c in chips" :key="c.text + c.label" type="button" @click="sendText(c.text)">
+        {{ c.label }}
+      </button>
+    </div>
+
+    <div v-if="!codexMode" class="creative-tabs" aria-label="创作快捷入口"><button v-for="intent in creativeIntents.filter(i => i.id !== 'canvas')" :key="intent.id" type="button" :disabled="busy || changingConversation" @click="useCreativeIntent(intent.id)"><DirectorIcon :name="intent.icon" :size="13" />{{ intent.id === 'original' ? '剧本原创' : intent.id === 'adapt' ? '剧本改编' : '提示词优化' }}</button></div>
+    <div v-if="codexMode" class="codex-workspace" :title="project.current?.name"><DirectorIcon name="canvas" :size="13" /><span>{{ selectedGenNode ? `当前选中 · ${selectedGenNode.data.label || selectedGenNode.id}` : project.current?.name || '当前项目画布' }}</span><span v-if="statusLive" class="codex-live" role="status">{{ statusText }}</span><span v-else class="context-note">项目对话持续保存</span></div>
+    <input ref="attachmentInput" type="file" hidden multiple accept=".txt,.md,.markdown,.fountain,.srt,.ass,.lrc,.json,.csv" aria-label="上传故事文本" @change="onAttachmentFiles" />
+    <form class="composer" @submit.prevent="send" @dragover.prevent @drop.prevent="addTextFiles(Array.from($event.dataTransfer?.files || []))">
+      <p v-if="input.trim() && estimate.calls" class="estimate">
+        预计 {{ estimate.calls }} 次调用 · 约 {{ Math.max(1, Math.ceil(estimate.seconds / 60)) }} 分钟
+      </p>
+      <div class="box" :class="{ busy }">
+        <div v-if="referenceOpen" class="reference-picker nodrag nowheel" role="dialog" aria-label="引用画布内容" @wheel.stop @pointerdown.stop>
+          <div class="reference-picker-head"><strong>引用节点或资源</strong><button type="button" aria-label="关闭引用选择" @click="referenceOpen = false"><DirectorIcon name="close" :size="14" /></button></div>
+          <input v-model="referenceSearch" aria-label="搜索节点或资源" placeholder="搜索当前项目…" @keydown.esc.stop="referenceOpen = false" />
+          <div ref="referenceList" role="listbox" aria-label="可引用内容" @wheel="referenceScroll.onWheel" @pointerdown="referenceScroll.stop" @keydown="referenceScroll.stop"><button v-for="(item, index) in filteredReferences" :key="item.key" type="button" role="option" :aria-selected="index === referenceIndex" :class="{ highlighted: index === referenceIndex }" :data-reference-id="item.key" @pointerdown.prevent @click="addReference(item)"><DirectorIcon :name="item.kind === 'node' ? 'canvas' : 'reference'" :size="15" /><span>{{ item.label }}</span><small>{{ item.detail }}</small></button><p v-if="!filteredReferences.length" class="reference-empty">没有可引用的内容，试试其他名称</p></div>
+        </div>
+        <div v-if="batchPromptMode || references.length" class="context-chips">
+          <span v-if="batchPromptMode" class="context-chip batch-context">批量优化 · {{ references.filter(r => r.kind === 'node' && mediaNodes.some(n => n.id === r.id)).length || mediaNodes.length }} 个节点<button type="button" aria-label="取消批量优化" @click="batchPromptMode = false">×</button></span>
+          <span v-for="item in references" :key="item.key" class="context-chip" :title="item.detail + ' · ' + item.id">@ {{ item.label }}<button type="button" :aria-label="`移除引用 ${item.label}`" @click="references = references.filter(r => r.key !== item.key)">×</button></span>
+        </div>
+        <div v-if="attachments.length" class="attach-chips">
+          <span v-for="(a, i) in attachments" :key="a.path || a.name" class="attach-chip">
+            📎 {{ a.name }}
+            <button type="button" :disabled="busy || changingConversation" title="移除附件" @click="removeAttachment(i)">×</button>
+          </span>
+        </div>
+        <textarea
+          ref="composerInput"
+          v-model="input"
+          rows="3"
+          :disabled="busy || changingConversation"
+          :placeholder="codexMode ? codexHome ? '描述你想做的事…' : '继续对话，或者 @ 引用画布内容…' : '开始你的创作，或者 @ 引用节点 / 资源…'"
+          aria-label="和 AI 导演对话"
+          @input="onComposerInput"
+          @keydown="composerKeydown"
+        />
+        <div class="bar">
+          <div class="bar-pop">
+            <button
+              type="button"
+              class="bar-btn attach-btn"
+              :disabled="busy || changingConversation"
+              :title="codexMode ? '附件与创作' : '上传故事或剧本文本'" :aria-label="codexMode ? '附件与创作' : '上传文本附件'"
+              @click.stop="codexMode ? codexAddOpen = !codexAddOpen : pickAttachments()"
+            >
+              <svg v-if="codexMode" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+              <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M21 12.5l-8.2 8.2a5.6 5.6 0 0 1-7.9-7.9L13 4.7a3.8 3.8 0 0 1 5.4 5.4l-8.1 8.1a1.9 1.9 0 0 1-2.7-2.7l7.5-7.5" />
+              </svg>
+              <span class="sr-only">附件与创作</span>
+            </button>
+            <div v-if="codexMode && codexAddOpen" class="menu codex-add-menu"><button type="button" @click="codexAddOpen = false; pickAttachments()">上传文本附件</button><button v-for="intent in creativeIntents" :key="intent.id" type="button" @click="codexAddOpen = false; useCreativeIntent(intent.id)">{{ intent.label }}</button><p class="menu-g">出片模式</p><button type="button" :class="{ on: shotChainMode === 'auto' }" @click="chooseShotChainMode('auto'); codexAddOpen = false">自动出片</button><button type="button" :class="{ on: shotChainMode === 'fl2va' }" @click="chooseShotChainMode('fl2va'); codexAddOpen = false">首尾帧链</button><button type="button" @click="memoryOpen = true; codexAddOpen = false">本地记忆</button></div>
+          </div>
+          <button type="button" class="bar-btn reference-trigger" :disabled="busy || changingConversation" :aria-expanded="referenceOpen" title="引用画布节点或项目资源" aria-label="引用节点或资源" @click="openReferences">@</button>
+          <div v-if="!codexMode" class="bar-pop">
+            <button
+              type="button"
+              class="bar-btn"
+              :disabled="busy || changingConversation"
+              title="出片生成模式：自动按参考图；首尾帧链取上一镜末帧保证镜头连续"
+              @click.stop="genModeOpen = !genModeOpen; modeOpen = false"
+            >
+              {{ shotChainMode === 'fl2va' ? '首尾帧链' : '自动出片' }}
+              <i />
+            </button>
+            <div v-if="genModeOpen" class="menu" @click.stop>
+              <button
+                type="button"
+                :class="{ on: shotChainMode === 'auto' }"
+                @click="chooseShotChainMode('auto')"
+              >
+                自动模式
+              </button>
+              <button
+                type="button"
+                :class="{ on: shotChainMode === 'fl2va' }"
+                @click="chooseShotChainMode('fl2va')"
+              >
+                首尾帧模式
+              </button>
+              <p class="tip">
+                {{
+                  shotChainMode === 'fl2va'
+                    ? '首尾帧链：第 1 镜用本镜配图起手；第 2 镜起自动截取上一镜视频的最后一帧作首帧，下一镜的配图作尾帧，镜头间画面连续。因为下一镜要等上一镜出片，批量出片会自动改成按镜号串行（一次一镜）。凑不齐首尾帧的镜头会自动退回常规出片，不会卡住生成。'
+                    : '每镜按自己的参考图 / 关键帧出片（默认）。想要镜头之间画面连续就选首尾帧模式。'
+                }}
+              </p>
+            </div>
+          </div>
+          <div class="bar-pop">
+            <button
+              type="button"
+              class="bar-btn"
+              :disabled="busy || changingConversation"
+              :title="currentMode.desc"
+              @click.stop="modeOpen = !modeOpen; prefOpen = false"
+            >
+              {{ currentMode.label }}
+              <i />
+            </button>
+            <div v-if="modeOpen" class="menu" @click.stop>
+              <button
+                v-for="m in MODES"
+                :key="m.id"
+                type="button"
+                :class="{ on: autonomy === m.id }"
+                @mouseenter="hoverMode = m.id"
+                @mouseleave="hoverMode = null"
+                @click="chooseAutonomy(m.id)"
+              >
+                {{ m.label }}
+              </button>
+              <p class="tip">{{ modeTip }}</p>
+            </div>
+          </div>
+
+          <CodexRunSelect v-if="settings.config.assistantEngine === 'codex'" :disabled="busy || statusLive || changingConversation" />
           <button
             v-if="busy"
             type="button"
@@ -904,11 +1289,11 @@ function visibleRows(rows: TraceRow[]) {
             v-else
             type="submit"
             class="icon-act send"
-            title="发送"
-            :disabled="!input.trim()"
+            title="发送 · Enter（Shift+Enter 换行）" aria-label="发送消息"
+            :disabled="!input.trim() || changingConversation"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M5 12h12M13 6l6 6-6 6" />
+              <path d="M12 19V5m-6 6 6-6 6 6" />
             </svg>
           </button>
         </div>
@@ -918,22 +1303,25 @@ function visibleRows(rows: TraceRow[]) {
 </template>
 
 <style scoped>
+.tool-approval{padding:10px 14px;border-bottom:1px solid #69613c;background:#493e242e;font-size:12px;white-space:pre-wrap}.tool-approval p{margin:0 0 8px}.tool-approval button{margin-right:8px;padding:5px 12px;border:1px solid #777;border-radius:6px;background:#303036;color:#eee}
 .agent {
   position: relative;
   width: 100%;
   height: 100%;
   flex-shrink: 0;
   min-width: 0;
-  border-right: 1px solid var(--color-border);
   background: var(--color-bg-1);
   display: flex;
   flex-direction: column;
   min-height: 0;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
+.head-actions { display: flex; align-items: center; gap: 3px; }
+.head, .target, .chips, .composer { flex-shrink: 0; }
 /* ── 头部 ── */
 .head {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1101,6 +1489,7 @@ function visibleRows(rows: TraceRow[]) {
 /* ── 消息流 ── */
 .msgs {
   flex: 1;
+  min-height: 0;
   min-width: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -1292,7 +1681,7 @@ function visibleRows(rows: TraceRow[]) {
 }
 textarea {
   width: 100%;
-  min-height: 96px;
+  min-height: 72px;
   resize: none;
   background: transparent;
   border: none;
@@ -1305,6 +1694,7 @@ textarea {
 }
 .bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   min-height: 32px;
@@ -1696,4 +2086,129 @@ textarea {
   fill: currentColor;
   stroke: none;
 }
+@media (max-height: 740px) {
+  .target .preview, .target-chips { display: none; }
+  .target { padding: 7px 10px; margin-bottom: 4px; }
+  .chips { padding-bottom: 4px; }
+  .head { padding-block: 8px; }
+  .composer { padding: 6px 8px 8px; }
+  textarea { min-height: 54px; height: 54px; }
+}
+
+/* Director panel: quiet chrome, a spacious start screen, and one composer. */
+.director { background:var(--color-bg-1); }
+.director .head { padding:12px 12px 10px 16px; min-height:54px; gap:6px; }
+.director .head-actions { gap:1px; flex-shrink:0; }
+.director .head-btn { width:27px; height:28px; padding:5px; border-radius:7px; }
+.director .head-btn:disabled { opacity:.3; cursor:default; }
+.director .head-btn:focus-visible,.conversation-toggle:focus-visible,.welcome-actions button:focus-visible,.creative-tabs button:focus-visible { outline:2px solid var(--color-accent); outline-offset:2px; }
+.director .head-btn.pref-btn { padding:5px; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+.context-note { font-size:10px; color:var(--color-text-4); padding-left:1px; }
+.conversation-pop { position:relative; display:flex; align-items:flex-start; flex-direction:column; gap:3px; flex:1; min-width:0; }
+.conversation-toggle { display:flex; align-items:center; gap:6px; max-width:100%; padding:4px 1px; color:var(--color-text-2); background:transparent; border:0; font:inherit; font-size:12px; cursor:pointer; }
+.conversation-toggle span { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.conversation-toggle:disabled { cursor:default; }
+.director-status { display:flex; align-items:center; gap:5px; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#5ddad1; font-size:10px; }
+.director-status i { width:5px; height:5px; flex-shrink:0; border-radius:50%; background:currentColor; }
+.conversation-menu { position:absolute; top:calc(100% + 10px); left:0; width:min(290px,calc(100vw - 72px)); max-height:280px; overflow:auto; padding:6px; border:1px solid var(--color-border-strong); border-radius:12px; background:var(--color-bg-2); box-shadow:0 8px 32px #0005; z-index:30; }
+.conversation-menu > p { margin:8px 9px 4px; color:var(--color-text-4); font-size:10px; }
+.conversation-menu button { display:flex; align-items:center; gap:7px; width:100%; padding:9px; border:0; border-radius:7px; background:transparent; color:var(--color-text-2); font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.conversation-menu button span { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1; }
+.conversation-menu button small { color:var(--color-text-4); font-size:10px; flex-shrink:0; }
+.conversation-menu button:hover:not(:disabled),.conversation-entry.current { background:var(--color-fill-hover); color:var(--color-text-1); }
+.conversation-entry { display:flex; align-items:center; border-radius:7px; min-width:0; }
+.conversation-menu .conversation-select { flex:1; min-width:0; }
+.conversation-entry.current .conversation-select { color:var(--color-text-1); }
+.conversation-menu .conversation-rename { flex:0 0 28px; width:28px; height:28px; padding:6px; margin-right:3px; justify-content:center; color:var(--color-text-3); }
+.conversation-menu button:disabled { opacity:.5; cursor:default; }
+.conversation-menu button:focus-visible { outline:2px solid var(--color-accent); outline-offset:-2px; }
+.conversation-rename-form { flex:1; min-width:0; padding:6px; }
+.conversation-rename-form input { box-sizing:border-box; width:100%; min-width:0; padding:7px 8px; border:1px solid var(--color-accent); border-radius:6px; background:var(--color-bg-1); color:var(--color-text-1); font:inherit; font-size:12px; }
+.rename-actions { display:flex; align-items:center; justify-content:flex-end; gap:4px; margin-top:5px; }
+.conversation-menu .rename-actions button { width:auto; padding:4px 8px; font-size:11px; }
+.rename-actions button[type=submit] { color:var(--color-accent); }
+.rename-error { flex:1; font-size:10px; line-height:1.4; color:#f59a9a; }
+.director .target { padding:9px 11px; margin:0 14px 6px; background:var(--color-fill); border-radius:10px; }
+.director .target .k { font-size:9px; font-weight:500; }
+.director .target .name { font-size:12px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.director .target .preview { -webkit-line-clamp:2; max-height:34px; margin-top:4px; }
+.director .target-chips { margin-top:6px; }
+.director .target-chips button { background:transparent; border-color:var(--color-border); border-radius:6px; color:var(--color-text-3); padding:3px 6px; font-size:10px; }
+.director .msgs { padding:10px 16px 14px; gap:16px; }
+.director .msgs.welcome-scroll { padding:0 18px 12px; }
+.director-welcome { display:flex; flex-direction:column; flex:1; justify-content:center; min-height:min-content; }
+.welcome-identity { display:flex; flex-direction:column; align-items:center; text-align:center; padding:24px 0 20px; }
+.welcome-identity h2 { margin:17px 0 7px; color:var(--color-text-1); font-size:18px; line-height:1.65; font-weight:400; letter-spacing:.01em; }
+.welcome-identity h2 strong { font-weight:600; }
+.welcome-identity p { margin:0; color:var(--color-text-4); font-size:11px; }
+.welcome-actions { display:flex; flex-direction:column; gap:3px; padding:0 2px; }
+.welcome-actions > button { display:flex; align-items:center; gap:11px; width:100%; min-height:52px; padding:9px 11px; border:1px solid transparent; border-radius:11px; background:transparent; color:var(--color-text-3); text-align:left; cursor:pointer; transition:background .15s,color .15s; }
+.welcome-actions > button:hover { border-color:var(--color-border); background:var(--color-fill); color:var(--color-text-1); }
+.welcome-actions button > svg { flex-shrink:0; }
+.welcome-actions button > svg:last-child { margin-left:auto; opacity:.6; }
+.welcome-actions button > span { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.welcome-actions b { font-size:12px; font-weight:400; }
+.welcome-actions small { color:var(--color-text-4); font-size:10px; font-weight:400; }
+.msg-orb { margin-top:5px; }
+.director .msg.assistant .bubble { background:transparent; border:0; padding:4px 3px; }
+.director .msg.user .bubble { background:var(--color-bg-3); border:1px solid var(--color-border); }
+.director .bubble { font-size:12px; }
+.director .bubble-copy { top:auto; bottom:-18px; right:0; }
+.director .creative-tabs { display:flex; flex-shrink:0; gap:6px; padding:8px 13px 7px; }
+.creative-tabs button { display:flex; align-items:center; gap:5px; padding:5px 7px; border:1px solid var(--color-border); border-radius:7px; background:var(--color-fill); color:var(--color-text-3); font:inherit; font-size:10px; cursor:pointer; white-space:nowrap; }
+.creative-tabs button:hover:not(:disabled) { color:var(--color-text-1); background:var(--color-fill-hover); }
+.creative-tabs button:disabled { opacity:.4; cursor:default; }
+.director .composer { padding:0 10px 10px; border-top:0; position:relative; }
+.director .composer .box { position:relative; padding:10px 10px 8px; border-radius:17px; background:color-mix(in srgb,var(--color-bg-1) 70%,var(--color-bg-2)); border-color:var(--color-border-strong); }
+.director .box:focus-within { border-color:color-mix(in srgb,#43d4d9 50%,var(--color-border)); box-shadow:0 0 0 2px #2cd8d808; }
+.director textarea { box-sizing:border-box; min-height:76px; max-height:180px; padding:2px 2px 10px; font-size:12px; line-height:1.7; }
+.director textarea::placeholder { color:var(--color-text-4); }
+.director .bar { gap:3px; flex-wrap:nowrap; position:relative; }
+.director .bar-pop { position:static; }
+.director .bar-btn { padding:0 6px; font-size:10px; height:29px; }
+.director .attach-btn { width:27px; padding:5px; justify-content:center; }
+.director .attach-btn svg { width:16px; height:16px; }
+.reference-trigger { font-size:16px !important; width:27px; justify-content:center; }
+.director .menu { left:0; right:auto; bottom:calc(100% + 10px); width:100%; max-height:270px; overflow:auto; box-sizing:border-box; }
+.director .icon-act { width:30px; height:30px; border-radius:10px; margin-left:auto; }
+.director .send { background:var(--color-text-1); color:var(--color-bg-1); }
+.director .send:disabled { background:var(--color-fill-strong); color:var(--color-text-4); opacity:1; }
+.director .estimate { font-size:10px; padding-inline:5px; }
+.context-chips { display:flex; flex-wrap:wrap; gap:5px; padding:0 0 8px; }
+.context-chip { display:inline-flex; align-items:center; max-width:100%; gap:5px; padding:4px 6px; border:1px solid var(--color-border); border-radius:6px; font-size:10px; color:var(--color-text-2); background:var(--color-fill); overflow-wrap:anywhere; }
+.context-chip button { display:grid; place-items:center; padding:0 1px; border:0; background:transparent; color:var(--color-text-4); cursor:pointer; font-size:13px; }
+.batch-context { color:#5bd9d1; border-color:#47d3cf30; }
+.reference-picker { display:flex; flex-direction:column; position:absolute; bottom:calc(100% + 8px); left:0; width:100%; max-height:min(300px,36vh); padding:7px; box-sizing:border-box; border:1px solid var(--color-border-strong); border-radius:12px; background:var(--color-bg-2); box-shadow:0 8px 30px #0006; z-index:20; }
+.reference-picker-head { flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:3px 3px 8px; color:var(--color-text-2); font-size:11px; }
+.reference-picker-head strong { font-weight:500; }
+.reference-picker-head button { border:0; padding:2px; background:transparent; color:var(--color-text-3); cursor:pointer; }
+.reference-picker > input { flex-shrink:0; width:100%; padding:7px; box-sizing:border-box; border:1px solid var(--color-border); border-radius:6px; color:var(--color-text-1); background:var(--color-bg-1); font:inherit; font-size:11px; outline:none; }
+.reference-picker > [role=listbox] { flex:1 1 auto; overflow-y:auto; overflow-x:hidden; min-height:0; padding-top:5px; overscroll-behavior:contain; overflow-anchor:none; scrollbar-gutter:stable; scroll-behavior:auto; }
+.reference-picker [role=option] { display:flex; align-items:center; gap:7px; width:100%; padding:8px 6px; background:transparent; color:var(--color-text-2); font:inherit; font-size:11px; border:0; border-radius:6px; text-align:left; cursor:pointer; }
+.reference-picker [role=option].highlighted,.reference-picker [role=option]:hover { background:var(--color-fill-hover); }
+.reference-picker [role=option] span { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.reference-picker [role=option] small { font-size:9px; color:var(--color-text-4); white-space:nowrap; }
+.reference-empty { padding:8px; margin:0; color:var(--color-text-4); font-size:11px; }
+@media (max-height:740px) { .welcome-identity { padding:14px 0 12px; } .welcome-identity h2 { font-size:16px; margin-top:12px; } .welcome-actions > button { min-height:44px; padding-block:7px; } .welcome-actions small { display:none; } .director textarea { min-height:64px; height:64px; } }
+@media (max-width:480px) { .director .head { padding-inline:11px; } .director .head-btn { width:25px; padding:4px; } .director .head-actions { gap:0; } .director .creative-tabs { gap:4px; padding-inline:11px; } .creative-tabs button { padding-inline:6px; } .director .bar-btn { padding-inline:4px; } }
+@media (prefers-reduced-motion:reduce) { .director *, .director *::before,.director *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } }
+</style>
+
+<style scoped>
+.codex-layout .head{padding:8px 10px 7px;min-height:36px;box-sizing:border-box;align-items:center;gap:4px}
+.codex-nav{display:flex;align-items:center;gap:4px;flex:1;min-width:0}.codex-nav h2{margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:400;color:var(--color-text-2)}.codex-home .codex-nav h2{color:var(--color-text-3)}.codex-nav .codex-back{flex-shrink:0;width:22px;padding:3px}
+.codex-layout .head-actions{gap:0}.codex-layout .head-btn{width:24px;height:25px;padding:4px;flex-shrink:0}.codex-layout :deep(.assistant-engine>summary){font-size:10px;border:0;padding:4px;max-width:83px;overflow:hidden;text-overflow:ellipsis}.codex-layout .head-actions>.mem-pop:empty{display:none}
+.codex-chat-more{position:relative}.codex-chat-more>summary{cursor:pointer;list-style:none}.codex-chat-more>summary::-webkit-details-marker{display:none}.codex-more-menu{position:absolute;right:0;top:calc(100% + 7px);z-index:150;width:130px;padding:5px;border:1px solid var(--color-border);border-radius:9px;background:var(--color-bg-2);box-shadow:0 8px 25px #0003}.codex-more-menu button{width:100%;text-align:left;padding:8px;border:0;border-radius:5px;background:transparent;color:var(--color-text-2);font:inherit;font-size:11px;cursor:pointer}.codex-more-menu button:hover{background:var(--color-fill)}.codex-more-menu button:disabled{opacity:.4;cursor:default}
+.codex-layout .msgs{padding:16px 14px 18px;gap:20px}.codex-layout .msgs.welcome-scroll{padding:16px 14px 18px}.codex-layout .msg.assistant{width:100%}.codex-layout .msg.assistant .bubble{padding:0;max-width:100%;width:100%;font-size:12px;line-height:1.8}.codex-layout .msg.user .bubble{background:var(--color-fill);border:0;border-radius:14px;padding:10px 12px;max-width:88%;font-size:12px}.codex-layout .turn{margin:0;padding:0;border-top:0}.codex-work{color:var(--color-text-3);font-size:11px}.codex-work>summary{list-style:none;display:flex;align-items:center;gap:5px;cursor:pointer;padding:4px 0}.codex-work>summary::-webkit-details-marker{display:none}.codex-work[open]>summary{margin-bottom:8px}.codex-work:not([open])>summary svg{transform:rotate(-90deg)}
+.codex-layout .think{padding:3px 0;font-size:11px}.codex-layout :deep(.trace-list){gap:6px}.codex-layout :deep(.trace-list .row){background:transparent;border:0;padding:3px 0}.codex-workspace{display:flex;align-items:center;gap:6px;padding:6px 14px 8px;flex-shrink:0;color:var(--color-text-3);font-size:10px;min-width:0}.codex-workspace>span:first-of-type{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}.codex-workspace>.context-note{font-size:9px;white-space:nowrap}.codex-live{max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-accent)}
+/* Let the model picker consume the free space; keep Send/Stop beside it. */
+.codex-layout .bar > .icon-act { margin-left:3px; }
+.codex-layout .composer{padding:0 9px 9px}.codex-layout .composer .box{border-radius:18px;padding:10px 10px 7px;background:var(--color-bg-1);box-shadow:0 2px 8px #00000008}.codex-layout .composer textarea{min-height:56px;height:56px;padding:2px 2px 9px;line-height:1.7}.codex-layout .bar{gap:3px}.codex-layout .send{background:var(--color-accent);color:#fff;border-radius:50%;width:28px;height:28px}.codex-layout .send:disabled{background:var(--color-fill-strong);color:var(--color-text-4)}.codex-layout .stop{border-radius:50%;width:28px;height:28px}.codex-layout .chips{padding:0 14px 8px}.codex-layout .target{margin-top:4px;padding:6px 9px;flex-shrink:0}.codex-layout .target .preview,.codex-layout .target .target-chips{display:none}.codex-layout .target .k{display:none}.codex-layout .target .name{margin:0;font-size:10px;color:var(--color-text-3)}
+@media(max-width:500px){.codex-layout .head{padding-inline:8px}.codex-layout .head-btn{width:22px}.codex-layout :deep(.assistant-engine>summary){max-width:68px;font-size:9px}.codex-layout .codex-workspace>.context-note{display:none}.codex-layout .msgs{padding-inline:12px}}
+</style>
+
+<style scoped>
+.msgs{scroll-behavior:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.msgs.positioning{visibility:hidden}.msgs .msg{animation:none}
+.latest-shortcut{position:relative;height:0;flex-shrink:0;z-index:4}.latest-shortcut button{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);padding:6px 12px;border:1px solid var(--color-border-strong);border-radius:18px;background:var(--color-bg-2);color:var(--color-text-2);box-shadow:0 2px 10px #0002;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.latest-shortcut button:hover{color:var(--color-text-1);background:var(--color-fill-hover)}.latest-shortcut button:focus-visible{outline:2px solid var(--color-accent);outline-offset:2px}
 </style>

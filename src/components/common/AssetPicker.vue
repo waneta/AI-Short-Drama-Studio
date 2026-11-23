@@ -279,7 +279,7 @@ function labelOf(a: Asset) {
 .mask {
   position: fixed;
   inset: 0;
-  z-index: 80;
+  z-index: 9500;
   background: rgba(0, 0, 0, 0.62);
   display: flex;
   align-items: center;

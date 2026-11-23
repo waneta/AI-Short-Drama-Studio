@@ -12,6 +12,7 @@ import { isFFmpegReady, getFFmpeg, resetFFmpeg } from '@/services/ffmpeg'
 import { desktop, isDesktop } from '@/services/desktop'
 import coreJsUrl from '@/assets/ffmpeg/ffmpeg-core.esm.js?url'
 import coreWasmUrl from '@/assets/ffmpeg/ffmpeg-core.wasm?url'
+import { codexStatusState, readCodexStatus } from '@/services/assistant/transport'
 
 const router = useRouter()
 const route = useRoute()
@@ -40,7 +41,7 @@ const diag = ref({
 
 const saving = ref(false)
 
-const llmReady = computed(() => endpointReady(settings.config.llm))
+const llmReady = computed(() => settings.config.assistantEngine === 'codex' ? Boolean(codexStatusState.value?.authenticated) : endpointReady(settings.config.llm))
 const assistantTargetsReady = computed(() =>
   ['vision', 'image', 'video'].every((kind) =>
     endpointReady(settings.config[kind as 'vision' | 'image' | 'video'])
@@ -49,6 +50,7 @@ const assistantTargetsReady = computed(() =>
 
 onMounted(async () => {
   await settings.ensureHydrated()
+  if (settings.config.assistantEngine === 'codex') void readCodexStatus().catch(() => { codexStatusState.value = undefined })
   storage.value = await estimateStorage()
   await assets.refresh()
   if (isDesktop()) {
@@ -68,15 +70,7 @@ async function saveSettings() {
   try {
     await settings.flush()
     toast.success('配置已保存到本机')
-    if (section.value === 'llm' && endpointReady(settings.config.llm)) {
-      const needsAssistant = !['vision', 'image', 'video'].every((kind) =>
-        endpointReady(settings.config[kind as 'vision' | 'image' | 'video'])
-      )
-      if (needsAssistant) {
-        toast.success('第 1 步完成，接下来让接入助手配置其他模型')
-        await router.replace('/settings/agent')
-      }
-    }
+
   } catch (e: any) {
     toast.error(e?.message || '保存失败，请再试一次')
   } finally {
@@ -277,7 +271,7 @@ const nav = [
     id: 'llm' as const,
     label: '语言模型',
     desc: '剧本、智能体、接入助手',
-    lead: '第一步：给 AI 配一个「大脑」。这里填的 Key 决定剧本写作、对话理解和后面的自动配置能不能跑起来。'
+    lead: '为剧本写作、对话理解和自动配置选择引擎：原始 LLM API 或 Codex CLI，并配置对应连接。'
   },
   {
     id: 'agent' as const,
@@ -348,7 +342,7 @@ function goBack() {
 
 function navReady(id: SettingsSection) {
   const c = settings.config
-  if (id === 'llm') return endpointReady(c.llm)
+  if (id === 'llm') return llmReady.value
   if (id === 'vision') return endpointReady(c.vision)
   if (id === 'image') return endpointReady(c.image)
   if (id === 'tts') return endpointReady(c.tts)
@@ -372,7 +366,7 @@ function navReady(id: SettingsSection) {
       </div>
     </header>
 
-    <p v-if="!isDesktop() && !llmReady" class="local-mode-note">
+    <p v-if="section !== 'llm' && !isDesktop() && !llmReady" class="local-mode-note">
       本地练习可以暂不配置语言模型：<RouterLink to="/">进入项目</RouterLink>，或在「图像生成」接入 ComfyUI。
       AI 写剧本和接入助手仍需要语言模型。
     </p>
@@ -408,11 +402,11 @@ function navReady(id: SettingsSection) {
       </nav>
 
       <main class="main">
-        <p class="page-lead">
+        <p v-if="section !== 'llm'" class="page-lead">
           {{ currentNav.lead }}
         </p>
         <section
-          v-if="(section === 'llm' || section === 'agent') && !(section === 'agent' && assistantTargetsReady)"
+          v-if="section === 'agent' && !assistantTargetsReady"
           class="onboarding"
         >
           <div class="onboarding-head">
@@ -426,13 +420,13 @@ function navReady(id: SettingsSection) {
             <button
               type="button"
               class="onboarding-step"
-              :class="{ active: section === 'llm', done: llmReady }"
+              :class="{ done: llmReady }"
               @click="go('llm')"
             >
               <i>{{ llmReady ? '✓' : '1' }}</i>
               <span>
                 <b>填语言模型</b>
-                <small>填接口地址、API Key 和模型名，然后点保存</small>
+                <small>选择原始 API 或 Codex，并完成对应连接配置</small>
               </span>
             </button>
             <div class="onboarding-arrow">→</div>
@@ -594,7 +588,7 @@ function navReady(id: SettingsSection) {
         </div>
       </main>
     </div>
-    <footer v-if="section !== 'system'" class="save-bar">
+    <footer v-if="section !== 'system' && section !== 'llm'" class="save-bar">
       <span>所有改动都保存在这台电脑上，换台机器不会同步。改完记得点保存。</span>
       <button type="button" class="save" :disabled="saving || !settings.diskReady" @click="saveSettings">
         {{ saving ? '保存中…' : '保存改动' }}
@@ -1066,4 +1060,9 @@ function navReady(id: SettingsSection) {
   letter-spacing: 1.5px;
   text-shadow: 0 0 14px rgba(96, 165, 250, 0.5);
 }
+</style>
+
+<style scoped>
+@media(max-width:760px){.side{width:140px;padding:10px 6px}.side a{padding:9px 6px;gap:4px}.side .state{display:none}.main{padding:14px 12px 28px}}
+@media(max-width:480px){.body{flex-direction:column}.side{width:auto;max-height:106px;display:flex;flex-wrap:wrap;gap:4px;border-right:0;border-bottom:1px solid var(--color-border)}.side .group{display:none}.side a{font-size:11px;padding:5px 8px;margin:0}.main{padding:12px}.crumb{display:none}}
 </style>

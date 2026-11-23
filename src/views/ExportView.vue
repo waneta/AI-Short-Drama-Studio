@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import RecoverShotVideos from '@/components/common/RecoverShotVideos.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore, useAssetsStore, useToastStore } from '@/stores'
@@ -8,7 +9,7 @@ import GradientButton from '@/components/common/GradientButton.vue'
 import Tag from '@/components/common/Tag.vue'
 import ProgressRing from '@/components/common/ProgressRing.vue'
 import { canBuildExport, ensureTimelineFromShots, timelineClipAssetId } from '@/utils/timeline'
-import { effectiveShotAudioMode, isDigitalHumanSpeechProject, needsExternalTts } from '@/utils/shot'
+import { keepShotSourceAudio, isDigitalHumanSpeechProject, needsExternalTts } from '@/utils/shot'
 
 const router = useRouter()
 const project = useProjectStore()
@@ -186,13 +187,9 @@ async function doExport() {
       if (!clip.enabled || voiceoverAudioMap.has(clip.shotId)) continue
       const shot = shots.value.find((s) => s.id === clip.shotId)
       if (!shot) continue
-      const audioMode = effectiveShotAudioMode(shot)
       sourceAudioMap.set(
         clip.shotId,
-        isSpeech.value ||
-          audioMode === 'h3-dialogue' ||
-          audioMode === 'h3-voiceover' ||
-          keepAmbientAudio.value
+        keepShotSourceAudio(shot, project.current, keepAmbientAudio.value)
       )
       if (digitalHuman || !needsExternalTts(shot, project.current)) continue
       if (!shot.audioAssetId) {
@@ -331,6 +328,7 @@ const segmentSummary = computed(() => {
         >下载视频</GradientButton>
       </div>
     </header>
+    <RecoverShotVideos :disabled="exporting" @restored="resultUrl = ''" />
 
     <div class="layout">
       <main class="left">
@@ -372,23 +370,23 @@ const segmentSummary = computed(() => {
           </div>
 
           <div v-if="!isSpeech" class="field">
-            <span>其他分镜原声（环境音效）</span>
+            <span>无口播镜头原声（环境音效）</span>
             <div class="format-grid">
               <button
                 class="format"
                 :class="{ active: keepAmbientAudio }"
                 @click="keepAmbientAudio = true"
               >
-                <div class="format-name">保留每镜声音</div>
-                <div class="format-desc">为 TTS / 无口播镜头留下环境音，再叠口播/BGM</div>
+                <div class="format-name">保留无口播镜头原声</div>
+                <div class="format-desc">为无口播镜头留下环境音，再叠BGM</div>
               </button>
               <button
                 class="format"
                 :class="{ active: !keepAmbientAudio }"
                 @click="keepAmbientAudio = false"
               >
-                <div class="format-name">去掉每镜声音</div>
-                <div class="format-desc">TTS / 无口播镜头静音；H3 自带人声仍会保留</div>
+                <div class="format-name">静音无口播镜头原声</div>
+                <div class="format-desc">仅静音无口播镜头；H3自带人声仍保留</div>
               </button>
             </div>
             <div v-if="keepAmbientAudio" class="ambient-vol">
@@ -405,8 +403,8 @@ const segmentSummary = computed(() => {
             <p class="hint" style="margin-top: 6px;">
               {{
                 keepAmbientAudio
-                  ? 'H3 对白/画外口播始终保留；其他镜头保留环境音。后期 TTS 只叠到选择了 TTS 的镜头。'
-                  : 'H3 对白/画外口播始终保留；仅静音 TTS / 无口播镜头的原声，避免重复人声。'
+                  ? 'H3对白/画外口播始终保留；无口播镜头保留原声。TTS镜头按字幕或AI视频页的“TTS原声”选项处理，默认保留原声并叠配音。'
+                  : 'H3对白/画外口播始终保留；无口播镜头静音。TTS镜头按每镜“TTS原声”选项处理，不受此开关影响。'
               }}
             </p>
           </div>

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import TtsSourceAudioSelect from '@/components/common/TtsSourceAudioSelect.vue'
 import { computed, ref, watch } from 'vue'
 import { useProjectStore, useAssetsStore, useToastStore, useSettingsStore } from '@/stores'
 import { llmChoiceKey, llmModelGroups, parseLlmChoiceKey } from '@/stores/settings'
@@ -20,6 +21,9 @@ import GenerationDetails from '@/components/common/GenerationDetails.vue'
 import VideoReferenceEditor from '@/components/canvas/VideoReferenceEditor.vue'
 import AudioReferenceControl from '@/components/canvas/AudioReferenceControl.vue'
 import NativeH3VideoControls from '@/components/common/NativeH3VideoControls.vue'
+import VideoGenerationModeSelect from '@/components/settings/VideoGenerationModeSelect.vue'
+import AutoDlVideoInputs from '@/components/canvas/AutoDlVideoInputs.vue'
+import { autodlWorkflowForProfile } from '@/services/ai/autodl'
 import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
 import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
 import TtsModelSelect from '@/components/settings/TtsModelSelect.vue'
@@ -326,6 +330,8 @@ const lastFrameId = computed({
     }
   }
 })
+const autodlWorkflow = computed(() => { const id = props.node?.data.videoProfileId; return autodlWorkflowForProfile(id ? settings.config.videos.find(p => p.id === id) : settings.config.video) })
+const isAutodlAudioSync = computed(() => autodlWorkflow.value?.mode === 'audio-sync')
 const isH3Fl2va = computed(() => isH3Video.value && h3GenMode.value === 'fl2va')
 /** 项目级「首尾帧链」：整条片按镜号首尾相接，不需要逐镜手动选帧 */
 const fl2vaChain = computed(() => isH3Video.value && isFl2vaChainActive(project.current))
@@ -745,7 +751,7 @@ async function optimizeVideoPrompt() {
           <span>烧录字幕到画面</span>
         </label>
 
-        <label>分镜原声（环境音）</label>
+        <label>无口播镜头原声（环境音）</label>
         <div class="seg">
           <button
             type="button"
@@ -767,8 +773,8 @@ async function optimizeVideoPrompt() {
         <p class="hint">
           {{
             keepAmbientAudio
-              ? '保留普通镜头环境音；H3 自带对白 / 口播始终保留。'
-              : '静音 TTS / 无口播镜头原声；H3 自带人声不受影响。'
+              ? '保留无口播镜头原声；TTS原声按每镜选择，H3对白/口播始终保留。'
+              : '静音无口播镜头原声；TTS按每镜选择，H3自带人声不受影响。'
           }}
         </p>
         <div v-if="keepAmbientAudio" class="vol-row">
@@ -951,7 +957,8 @@ async function optimizeVideoPrompt() {
         <p class="hint">
           优化按这个框里的原文改写成 H3 格式。你写的台词会进 &lt;d&gt;，口播栏为空也不会删掉。
         </p>
-        <VideoReferenceEditor v-if="!isH3Fl2va" :node-id="node.id" :model-value="shot.compiledVideoPrompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setShotVideoPrompt(shot!.id, value)" />
+        <AutoDlVideoInputs v-if="isAutodlAudioSync" :node-id="node.id" :disabled="running" />
+        <VideoReferenceEditor v-else-if="!isH3Fl2va" :node-id="node.id" :model-value="shot.compiledVideoPrompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setShotVideoPrompt(shot!.id, value)" />
         <textarea v-else
           rows="16"
           :value="shot.compiledVideoPrompt ?? ''"
@@ -986,7 +993,7 @@ async function optimizeVideoPrompt() {
         </p>
       </template>
 
-      <H3GenModeSelect v-if="isH3Video" v-model="h3GenMode" />
+      <H3GenModeSelect v-if="isH3Video && !autodlWorkflow" v-model="h3GenMode" />
       <FramePairSlots
         v-if="isH3Fl2va"
         v-model:first-id="firstFrameId"
@@ -1015,7 +1022,8 @@ async function optimizeVideoPrompt() {
           </button>
         </div>
         <p class="hint">优化按这个框里的原文改写成 H3 格式。只有真正台词进 &lt;d&gt;。</p>
-        <VideoReferenceEditor v-if="!isH3Fl2va" :node-id="node.id" :model-value="node.data.prompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setCanvasNodePrompt(node!.id, value)" />
+        <AutoDlVideoInputs v-if="isAutodlAudioSync" :node-id="node.id" :disabled="running" />
+        <VideoReferenceEditor v-else-if="!isH3Fl2va" :node-id="node.id" :model-value="node.data.prompt ?? ''" :disabled="running || optimizingPrompt" @update:model-value="value => project.setCanvasNodePrompt(node!.id, value)" />
         <textarea v-else
           rows="12"
           :value="node.data.prompt ?? ''"
@@ -1038,6 +1046,7 @@ async function optimizeVideoPrompt() {
         <label>人声方案</label>
         <select
           :value="effectiveShotAudioMode(shot)"
+          :disabled="running"
           @change="project.setShotAudioMode(shot.id, ($event.target as HTMLSelectElement).value as ShotAudioMode)"
         >
           <option value="h3-dialogue">H3 出镜对白 + 对口型</option>
@@ -1053,6 +1062,7 @@ async function optimizeVideoPrompt() {
           @input="project.updateShot(shot.id, { voiceover: ($event.target as HTMLTextAreaElement).value })"
         />
         <TtsModelSelect v-if="effectiveShotAudioMode(shot) === 'tts'" />
+        <TtsSourceAudioSelect :shot-id="shot.id" :disabled="running" />
         <label>说话音色</label>
         <textarea
           rows="2"
@@ -1103,6 +1113,7 @@ async function optimizeVideoPrompt() {
           :profile-id="node.data.videoProfileId"
           @select-profile="onSelectVideoProfile"
         />
+        <VideoGenerationModeSelect v-if="isVideoNode && autodlWorkflow" :node-id="node.id" />
         <NativeH3VideoControls v-if="isVideoNode" :node-id="node.id" />
       </div>
       <template v-if="node.type === 'script' && isPlayReady(project.current?.script)">

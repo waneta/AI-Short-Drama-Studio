@@ -67,7 +67,7 @@ export function getTtsConfig() {
   const s = pick()?.tts
   return {
     baseUrl: (s?.baseUrl || d.baseUrl).replace(/\/+$/, ''),
-    apiKey: s?.apiKey || d.apiKey,
+    apiKey: s?.apiKey ?? d.apiKey,
     model: s?.model || d.model,
     voice: s?.voice || d.voice
   }
@@ -78,13 +78,13 @@ export function getVideoPromptStyle(): VideoPromptStyle {
 }
 
 /** 内置 H3 要用 AutoDL 令牌。当前项若是 Zealman，不能拿来冒充 AutoDL。 */
-export function autodlVideoProfileId(): string | undefined {
+export function autodlVideoProfileId(workflowId?: string): string | undefined {
   const settings = pick()
   const list = (settings?.videos || []).filter((profile) => {
     const normalized = normalizeStoredVideoEndpoint(profile)
     if (normalized.provider === 'zealman') return false
     if (normalized.adapter?.type === 'zealman-workflow' && zealmanWorkflowById(normalized.workflowId || '')) return false
-    return normalized.provider === 'autodl' || isAutodlHost(normalized.baseUrl || '')
+    return (!workflowId || normalized.workflowId === workflowId) && (normalized.provider === 'autodl' || isAutodlHost(normalized.baseUrl || ''))
   })
   const active = list.find((profile) => profile.id === settings?.activeVideoId)
   return (active || list[0])?.id

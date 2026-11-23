@@ -18,8 +18,9 @@ const output = await build({
   define: { 'import.meta.env': '{}' },
   alias: { '@': path.join(root, 'src') },
   plugins: [{ name: 'fixture-runtime', setup(b) {
-    b.onResolve({ filter: /(?:^@\/services\/desktop$|(?:^\.\/|\/ai\/)runtime$|^@\/services\/ffmpeg$)/ }, args => ({ path: args.path, namespace: 'fixture' }))
+    b.onResolve({ filter: /(?:^@\/stores$|^@\/services\/desktop$|(?:^\.\/|\/ai\/)runtime$|^@\/services\/ffmpeg$)/ }, args => ({ path: args.path, namespace: 'fixture' }))
     b.onLoad({ filter: /.*/, namespace: 'fixture' }, args => ({ contents:
+      args.path === '@/stores' ? 'export const useSettingsStore=()=>({config:globalThis.__tutorialConfig}); export const useProjectStore=()=>({current:null});' :
       args.path.endsWith('desktop') ? 'export const isDesktop=()=>false; export const desktop=()=>({}); export const blobFromPath=()=>{throw Error("unexpected desktop")};' :
       args.path.endsWith('ffmpeg') ? 'export const toDigitalHumanWav=()=>{throw Error("unexpected ffmpeg")};' :
       `export const getAIMode=()=> 'real'; export const getImageConfig=()=>globalThis.__tutorialConfig.image; export const getVideoConfig=()=>globalThis.__tutorialConfig.video; export const getTtsConfig=()=>globalThis.__tutorialConfig.tts; export const getLlmConfig=()=>globalThis.__tutorialConfig.llm; export const getVisionConfig=()=>globalThis.__tutorialConfig.vision; export const getVideoPromptStyle=()=> 'scene-narrative'; export const autodlVideoProfileId=()=>undefined;`
@@ -77,16 +78,16 @@ try {
     assert.equal(url, 'https://api.openai.com/v1/images/generations')
     const body = JSON.parse(init.body)
     if ('response_format' in body) return new Response(JSON.stringify({ error: { message: "Unknown parameter: 'response_format'.", code: 'unknown_parameter' } }), { status: 400 })
-    assert(['1024x1024', '1536x1024', '1024x1536'].includes(body.size), `Unsupported GPT Image size: ${body.size}`)
+    assert(['1024x1024', '1536x1024', '1024x1536', '1536x864', '864x1536'].includes(body.size), `Unsupported GPT Image size: ${body.size}`)
     return json({ data: [{ b64_json: pngBase64 }] })
   }
-  for (const model of ['gpt-image-1', 'gpt-image-1-mini', 'gpt-image-1.5', 'gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'chatgpt-image-latest']) {
+  for (const model of ['gpt-image-1', 'gpt-image-1-mini', 'gpt-image-1.5', 'gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2.6-sunburst', 'gpt-image-2.6-flare', 'chatgpt-image-latest']) {
     config.image.model = model
     for (const [aspectRatio, width, height, size] of [
       ['16:9', 1280, 720, '1536x1024'], ['9:16', 720, 1280, '1024x1536'], ['1:1', 1024, 1024, '1024x1024']
     ]) {
       assert.equal((await api.generateImage({ ...imageInput, aspectRatio, width, height })).mimeType, 'image/png')
-      assert.equal(JSON.parse(calls.at(-1).body).size, size)
+      assert.equal(JSON.parse(calls.at(-1).body).size, /^gpt-image-2(?:$|\.)/.test(model) && aspectRatio !== '1:1' ? aspectRatio === '16:9' ? '1536x864' : '864x1536' : size)
     }
   }
   config.image.model = 'gpt-image-1'

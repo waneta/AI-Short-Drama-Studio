@@ -246,7 +246,8 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
   const keepPositions = preservePositions && !framesJustAdded
   const prev = new Map((keepPositions && layoutReady ? prevList : []).map((n) => [n.id, n]))
   const prevAny = new Map(prevList.map((n) => [n.id, n]))
-  const nodes: CanvasNode[] = []
+  const customFrames = prevList.filter(n => n.type === 'groupFrame' && n.data.kind === 'custom')
+  const nodes: CanvasNode[] = customFrames.map(n => ({ ...n }))
   const edges: CanvasEdge[] = []
   const groups: CanvasGraph['groups'] = []
   const shotH = pipelineNodeHeight(project.settings?.aspectRatio)
@@ -327,6 +328,10 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
       node.data = { imageProfileId: old?.data.imageProfileId, imageModel: old?.data.imageModel,
         generationSeed: old?.data.generationSeed, imageResolution: old?.data.imageResolution, imageWidth: old?.data.imageWidth,
         imageHeight: old?.data.imageHeight, ...node.data }
+    }
+    if (old?.parentGroupId && customFrames.some(g => g.id === old.parentGroupId)) {
+      nodes.push({ ...node, position: { ...old.position }, parentGroupId: old.parentGroupId })
+      return
     }
     const sameParent = old?.parentGroupId === groupId
     if (
@@ -588,7 +593,10 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
   const freeNodes = prevList.filter((node) => node.type === 'imageGen' || node.type === 'videoGen')
   const freeIds = new Set(freeNodes.map((node) => node.id))
   for (const node of freeNodes) {
-    if (!nodes.some((item) => item.id === node.id)) nodes.push({ ...node, parentGroupId: undefined })
+    if (!nodes.some((item) => item.id === node.id)) {
+      const parentGroupId = nodes.some(p => p.id === node.parentGroupId) ? node.parentGroupId : undefined
+      nodes.push({ ...node, position: parentGroupId ? node.position : absoluteCanvasPosition(prevList, node), parentGroupId })
+    }
   }
   const nodeIds = new Set(nodes.map((node) => node.id))
   for (const edge of project.canvas?.edges ?? []) {
@@ -596,6 +604,8 @@ export function rebuildCanvasGraph(project: Project, preservePositions = true): 
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue
     if (!edges.some((item) => item.id === edge.id)) edges.push(edge)
   }
+
+  for (const frame of customFrames) groups.push({ id: frame.id, label: frame.data.label || '组合', nodeIds: nodes.filter(n => n.parentGroupId === frame.id).map(n => n.id) })
 
   const viewport = project.canvas?.viewport ?? emptyCanvas().viewport
   return { nodes, edges, groups, viewport }

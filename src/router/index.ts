@@ -16,6 +16,12 @@ const routes: RouteRecordRaw[] = [
     meta: { step: null, label: '画布' }
   },
   {
+    path: '/generation-stats',
+    name: 'generation-stats',
+    component: () => import('@/views/GenerationStatsView.vue'),
+    meta: { step: null, label: '生成统计' }
+  },
+  {
     path: '/smart-speech',
     name: 'smart-speech',
     component: () => import('@/views/SmartSpeechView.vue'),
@@ -115,7 +121,7 @@ router.beforeEach(async (to) => {
   await project.ensureLoaded()
   await assets.refresh()
   project.startAutoSave()
-  if (to.name !== 'home' && to.name !== 'settings') {
+  if (to.name !== 'home' && to.name !== 'settings' && to.name !== 'generation-stats') {
     if (!project.current && project.allProjects.length > 0) {
       await project.load(project.allProjects[0].id)
     }

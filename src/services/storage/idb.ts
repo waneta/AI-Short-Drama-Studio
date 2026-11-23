@@ -204,3 +204,23 @@ export async function estimateStorage(): Promise<{ usage: number; quota: number 
   }
   return { usage: 0, quota: 0 }
 }
+
+/** Statistics needs metadata only; release each cursor's Blob handle immediately. */
+export async function listAssetMetadata(): Promise<Asset[]> {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const rows: Asset[] = []
+    const tx = db.transaction('assets', 'readonly')
+    const req = tx.objectStore('assets').openCursor()
+    req.onsuccess = () => {
+      const cursor = req.result
+      if (!cursor) return
+      const { blob: _blob, ...meta } = cursor.value
+      rows.push(meta as Asset)
+      cursor.continue()
+    }
+    tx.oncomplete = () => resolve(rows)
+    tx.onabort = () => reject(tx.error || new Error('读取历史记录已中断'))
+    tx.onerror = () => reject(tx.error)
+  })
+}

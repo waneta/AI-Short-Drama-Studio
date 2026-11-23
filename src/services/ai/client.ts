@@ -5,6 +5,8 @@
 export type { AIMode } from '@/stores/settings'
 export { getAIMode } from './runtime'
 
+import { useSettingsStore } from '@/stores'
+import { withAssistantTask } from '@/services/assistant/state'
 import { desktop, isDesktop } from '@/services/desktop'
 import { parseJsonRobust } from '@/utils/jsonRepair'
 import { mockLLM } from './mock'
@@ -153,6 +155,44 @@ type LlmHttpResult = {
   json: () => Promise<any>
 }
 
+type LlmTokenKey = 'max_tokens' | 'max_completion_tokens'
+type LlmCompatibility = { tokenKey: LlmTokenKey; omitTemperature: boolean }
+// Endpoint/model capabilities only; credentials and user messages are never cached.
+const llmCompatibility = new Map<string, LlmCompatibility>()
+
+function applyLlmCompatibility(payload: Record<string, unknown>, compatibility?: LlmCompatibility) {
+  if (!compatibility) return
+  const limit = payload.max_completion_tokens ?? payload.max_tokens
+  delete payload.max_tokens
+  delete payload.max_completion_tokens
+  if (limit !== undefined) payload[compatibility.tokenKey] = limit
+  if (compatibility.omitTemperature) delete payload.temperature
+}
+
+/** Retry only explicit parameter rejection, never authentication/quota/general validation errors. */
+function adaptLlmParameters(payload: Record<string, unknown>, status: number, detail: string, changed: Set<string>): boolean {
+  if (status !== 400) return false
+  let error: { param?: string; code?: string; message?: string } = {}
+  try { const data = JSON.parse(detail); error = data.error || data } catch { /* Some compatible endpoints return plain text. */ }
+  const message = typeof error.message === 'string' ? error.message : detail
+  if (!/unsupported_parameter|unsupported_value/.test(error.code || '') && !/unsupported|not supported|does not support/i.test(message)) return false
+  const rejects = (param: string) => error.param ? error.param === param : new RegExp(`\\b${param}\\b`).test(message)
+  for (const [from, to] of [['max_tokens', 'max_completion_tokens'], ['max_completion_tokens', 'max_tokens']] as const) {
+    if (!changed.has('token_limit') && payload[from] !== undefined && rejects(from) && new RegExp(`\\b${to}\\b`).test(message)) {
+      payload[to] = payload[from]
+      delete payload[from]
+      changed.add('token_limit')
+      return true
+    }
+  }
+  if (!changed.has('temperature') && payload.temperature !== undefined && rejects('temperature')) {
+    delete payload.temperature
+    changed.add('temperature')
+    return true
+  }
+  return false
+}
+
 /** 把图片压成 JPEG data URL，避免多模态请求过大（最多约 1280 边） */
 export async function blobToChatImageUrl(
   blob: Blob,
@@ -175,6 +215,17 @@ export async function blobToChatImageUrl(
 
 /** LLM 通用调用（OpenAI 兼容 /chat/completions） */
 export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
+  // Vision keeps its separate provider. All text functions share the selected engine.
+  return withAssistantTask(async () => {
+    if (req.provider !== 'vision' && useSettingsStore().config.assistantEngine === 'codex') {
+      const { callCodexText } = await import('@/services/assistant/transport')
+      return callCodexText(req)
+    }
+    return callLLMApi(req)
+  })
+}
+
+async function callLLMApi(req: LLMRequest): Promise<LLMResponse> {
   if (getAIMode() === 'mock') {
     return mockLLM(req)
   }
@@ -242,7 +293,7 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
     return { ok: resp.ok, status: resp.status, errText, json: () => resp.json() }
   }
 
-  const post = async (
+  const postWithNetworkRetry = async (
     payload: Record<string, unknown>,
     signal = control.signal
   ): Promise<LlmHttpResult> => {
@@ -260,6 +311,25 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
       await abortableDelay(700 * (attempt + 1), signal)
     }
     throw last instanceof Error ? last : new Error(String(last ?? '语言模型请求失败'))
+  }
+
+  const compatibilityKey = `${url}\0${model}`
+  const post = async (payload: Record<string, unknown>, signal = control.signal): Promise<LlmHttpResult> => {
+    applyLlmCompatibility(payload, llmCompatibility.get(compatibilityKey))
+    const changed = new Set<string>()
+    // At most one token-field switch and one temperature removal per request.
+    for (let attempt = 0; ; attempt++) {
+      const result = await postWithNetworkRetry(payload, signal)
+      if (result.ok) {
+        llmCompatibility.set(compatibilityKey, {
+          tokenKey: payload.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens',
+          omitTemperature: payload.temperature === undefined
+        })
+        if (llmCompatibility.size > 128) llmCompatibility.delete(llmCompatibility.keys().next().value!)
+        return result
+      }
+      if (attempt >= 2 || !adaptLlmParameters(payload, result.status, result.errText, changed)) return result
+    }
   }
 
   try {
@@ -296,12 +366,13 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
     if (req.jsonMode && !isValidJsonOutput(content)) {
       const followControl = controlledSignal(req.signal, Math.min(timeoutMs, 240_000))
       try {
+        const tokenKey: LlmTokenKey = body.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens'
         const follow = {
           ...body,
           temperature: 0,
-          max_tokens: Math.min(
+          [tokenKey]: Math.min(
             12_000,
-            Math.max(Math.ceil((Number(body.max_tokens) || 4000) * 1.5), 6000)
+            Math.max(Math.ceil((Number(body[tokenKey]) || 4000) * 1.5), 6000)
           ),
           messages: [
             ...req.messages,

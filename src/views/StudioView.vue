@@ -1,12 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { VueFlow, useVueFlow, type Connection, type Edge, type Node, type NodeMouseEvent } from '@vue-flow/core'
+import { VueFlow, useVueFlow, wheelDelta, SelectionMode, type Connection, type Edge, type EdgeChange, type Node, type NodeMouseEvent } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
-import { Controls } from '@vue-flow/controls'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
-import '@vue-flow/controls/dist/style.css'
 import { useProjectStore, useAssetsStore, useToastStore } from '@/stores'
 import { rebuildCanvasGraph, NODE_W, nextFreeformPosition, rescueStrandedFreeformNodes } from '@/services/canvas/layout'
 import { setCanvasReveal, setCanvasInspect, setCanvasSelect } from '@/services/canvas/canvasBridge'
@@ -19,9 +17,18 @@ import { isDesktop, desktop } from '@/services/desktop'
 import PipelineNode from '@/components/canvas/PipelineNode.vue'
 import AudioNode from '@/components/canvas/AudioNode.vue'
 import ScriptDocNode from '@/components/canvas/ScriptDocNode.vue'
+import { useCanvasContextActions } from '@/composables/useCanvasContextActions'
+import CanvasNodeContextMenu from '@/components/canvas/CanvasNodeContextMenu.vue'
+import CanvasContextDialog from '@/components/canvas/CanvasContextDialog.vue'
+import { useCanvasEditing } from '@/composables/useCanvasEditing'
+import { useCanvasViewport } from '@/composables/useCanvasViewport'
+import CanvasShortcutPanel from '@/components/canvas/CanvasShortcutPanel.vue'
 import GroupFrame from '@/components/canvas/GroupFrame.vue'
+import FlowConnectionEdge from '@/components/canvas/FlowConnectionEdge.vue'
 import FreeformGenNode from '@/components/canvas/FreeformGenNode.vue'
 import AgentChat from '@/components/canvas/AgentChat.vue'
+import AgentOrb from '@/components/canvas/AgentOrb.vue'
+import StudioSidebar from '@/components/canvas/StudioSidebar.vue'
 import CanvasGuide from '@/components/canvas/CanvasGuide.vue'
 import NodeInspector from '@/components/canvas/NodeInspector.vue'
 import CanvasToolbarIcon from '@/components/canvas/CanvasToolbarIcon.vue'
@@ -31,7 +38,18 @@ const project = useProjectStore()
 const assets = useAssetsStore()
 const toast = useToastStore()
 const router = useRouter()
-const agentOpen = ref(true)
+const agentOpen = ref(false)
+const agentBusy = ref(false)
+const workspaceMenu = ref<HTMLDetailsElement>()
+const agentDocked = ref(false)
+const studioRoot = ref<HTMLElement>()
+const agentFloatHost = ref<HTMLElement>()
+const agentDockHost = ref<HTMLElement>()
+const sidebarOpen = ref(window.innerWidth > 760)
+const viewportWidth = ref(window.innerWidth)
+const flowWrap = ref<HTMLElement | null>(null)
+const agentToggle = ref<HTMLButtonElement | null>(null)
+const sidebarWidth = computed(() => !sidebarOpen.value ? 0 : viewportWidth.value <= 760 ? Math.min(300, viewportWidth.value - 56) : viewportWidth.value <= 1000 ? 260 : 300)
 const GUIDE_KEY = 'aicut:guide:canvas'
 const guideOpen = ref(localStorage.getItem(GUIDE_KEY) !== 'done')
 function dismissGuide() {
@@ -51,6 +69,8 @@ const optimizeAllProgress = ref('')
 // 合并模式：不再区分自由画布与创作模式，只有这一种画布
 // （保留 img2video 只是老项目的历史字段，不再用于功能分叉）
 
+const MIN_CANVAS_ZOOM = 0.2
+const MAX_CANVAS_ZOOM = 2
 const AGENT_WIDTH_KEY = 'aicut:agent-chat-width'
 const AGENT_MIN_WIDTH = 300
 const AGENT_MAX_WIDTH = 760
@@ -60,15 +80,17 @@ let previousBodyCursor = ''
 let previousBodyUserSelect = ''
 
 function maxAgentWidth() {
-  const rightDock = rightOpen.value ? 300 : 0
-  return Math.max(
-    AGENT_MIN_WIDTH,
-    Math.min(AGENT_MAX_WIDTH, window.innerWidth - rightDock - 360)
-  )
+  const studioWidth = studioRoot.value?.clientWidth ?? window.innerWidth
+  // Measure the whole studio when docked: the canvas has already given up this width.
+  const canvasWidth = flowWrap.value?.clientWidth ?? studioWidth
+  const available = agentDocked.value
+    ? viewportWidth.value <= 760 ? studioWidth : studioWidth - sidebarWidth.value - 320
+    : canvasWidth - (canvasWidth > 900 ? 320 : 24)
+  return Math.max(0, Math.min(AGENT_MAX_WIDTH, available))
 }
 
 function clampAgentWidth(value: number) {
-  return Math.round(Math.max(AGENT_MIN_WIDTH, Math.min(maxAgentWidth(), value)))
+  return Math.round(Math.max(Math.min(AGENT_MIN_WIDTH, maxAgentWidth()), Math.min(maxAgentWidth(), value)))
 }
 
 function persistAgentWidth() {
@@ -90,7 +112,7 @@ function loadAgentWidth() {
 
 function onAgentResizeMove(event: PointerEvent) {
   if (!resizingAgent.value) return
-  agentWidth.value = clampAgentWidth(resizeStartWidth + event.clientX - resizeStartX)
+  agentWidth.value = clampAgentWidth(resizeStartWidth - event.clientX + resizeStartX)
 }
 
 function stopAgentResize() {
@@ -106,6 +128,8 @@ function stopAgentResize() {
 
 function startAgentResize(event: PointerEvent) {
   if (event.button !== 0) return
+  const handle = event.currentTarget as HTMLElement | null
+  handle?.focus()
   event.preventDefault()
   resizeStartX = event.clientX
   resizeStartWidth = agentWidth.value
@@ -125,11 +149,98 @@ function nudgeAgentWidth(delta: number) {
 }
 
 function clampAgentToViewport() {
+  viewportWidth.value = window.innerWidth
+  if (agentOpen.value) {
+    if (window.innerWidth <= 760) sidebarOpen.value = false
+    if (window.innerWidth <= 1000 || agentDocked.value) rightOpen.value = false
+    if (agentDocked.value && window.innerWidth - sidebarWidth.value < AGENT_MIN_WIDTH + 320) sidebarOpen.value = false
+  }
   const next = clampAgentWidth(agentWidth.value)
   if (next !== agentWidth.value) agentWidth.value = next
 }
 
-watch(rightOpen, clampAgentToViewport)
+watch([rightOpen, sidebarOpen, agentDocked], () => nextTick(clampAgentToViewport))
+
+function toggleAgent() {
+  stopAgentResize()
+  agentOpen.value = !agentOpen.value
+  if (agentOpen.value) {
+    if (window.innerWidth <= 760) sidebarOpen.value = false
+    if (window.innerWidth <= 1000) rightOpen.value = false
+    nextTick(clampAgentToViewport)
+  }
+}
+
+function toggleAgentDock() {
+  stopAgentResize()
+  agentDocked.value = !agentDocked.value
+  if (agentDocked.value) rightOpen.value = false
+  void nextTick(clampAgentToViewport)
+}
+
+function toggleSidebar() {
+  sidebarOpen.value = !sidebarOpen.value
+  if (sidebarOpen.value && window.innerWidth <= 760) {
+    stopAgentResize()
+    agentOpen.value = false
+  }
+}
+
+watch(rightOpen, open => {
+  if (open && agentOpen.value && (agentDocked.value || window.innerWidth <= 1000)) closeAgent()
+})
+
+function closeAgent() {
+  stopAgentResize()
+  agentOpen.value = false
+  nextTick(() => agentToggle.value?.focus())
+}
+
+function focusSidebarNode(id: string) {
+  selectedId.value = id
+  if (findNode(id)) void editing.choose([id])
+  if (window.innerWidth <= 760) sidebarOpen.value = false
+  nextTick(() => fitView({ nodes: [id], padding: 0.5, minZoom: 1, maxZoom: 1, duration: 350 }))
+}
+
+// Screen coordinates are kept independently of canvas zoom/pan. Tab uses the
+// latest hover position; toolbar/sidebar buttons retain their default placement.
+let canvasPointer: { x: number; y: number } | null = null
+const blankContextMenu = ref<HTMLElement | null>(null)
+
+function rememberCanvasPointer(event: PointerEvent) {
+  canvasPointer = { x: event.clientX, y: event.clientY }
+}
+
+function showAddMenu(point: { x: number; y: number }, flow = screenToFlowCoordinate(point)) {
+  ctxMenu.value = { ...point, flow }
+  const menu = ctxMenu.value
+  void nextTick(() => {
+    if (ctxMenu.value !== menu || !blankContextMenu.value) return
+    const rect = blankContextMenu.value.getBoundingClientRect()
+    menu.x = Math.max(8, Math.min(point.x, window.innerWidth - rect.width - 8))
+    menu.y = Math.max(8, Math.min(point.y, window.innerHeight - rect.height - 8))
+  })
+}
+
+function openAddMenuAtPointer() {
+  const rect = flowWrap.value?.getBoundingClientRect()
+  const point = canvasPointer
+  if (rect && point && point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom) {
+    showAddMenu(point)
+  } else {
+    openAddMenu()
+  }
+}
+
+function openAddMenu() {
+  const rect = flowWrap.value?.getBoundingClientRect()
+  if (!rect) return
+  showAddMenu(
+    { x: rect.left + rect.width / 2 - 108, y: Math.max(rect.top + 8, rect.bottom - 340) },
+    screenToFlowCoordinate({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+  )
+}
 
 const nodeTypes = {
   script: ScriptDocNode,
@@ -148,7 +259,71 @@ const nodeTypes = {
   videoGen: FreeformGenNode
 }
 
-const { onConnect, onNodeDragStop, onMoveEnd, fitView, screenToFlowCoordinate } = useVueFlow()
+const edgeTypes = { connection: FlowConnectionEdge }
+
+const { connectionClickStartHandle, startConnection, updateConnection, endConnection, vueFlowRef, onConnect, onNodeDragStart, onNodeDrag, onNodeDragStop, fitView, screenToFlowCoordinate, findNode, addSelectedNodes, removeSelectedNodes, getSelectedNodes, getSelectedEdges, getViewport, setViewport, viewport, zoomIn, zoomOut } = useVueFlow()
+const canvasViewport = useCanvasViewport({ viewport, getViewport })
+// Vue Flow measures the drag threshold in canvas coordinates. Keep a 6px
+// screen-space dead zone so selecting a node does not turn hand jitter into a drag.
+const nodeDragThreshold = computed(() => 6 / viewport.value.zoom)
+const zoomPercent = computed(() => Math.round(viewport.value.zoom * 100))
+
+function closeWorkspaceMenu(event: PointerEvent) {
+  if (workspaceMenu.value?.open && !workspaceMenu.value.contains(event.target as HTMLElement)) workspaceMenu.value.open = false
+}
+
+// Vue Flow supports click-to-connect but only draws the drag preview by default.
+// Share its preview while a click connection is pending, using the same real ports.
+watch(connectionClickStartHandle, (handle, previous) => {
+  if (handle) {
+    const node = findNode(handle.nodeId)
+    const port = node?.handleBounds[handle.type]?.find((item) => item.id === handle.id)
+    const rect = vueFlowRef.value?.getBoundingClientRect()
+    startConnection({ ...handle, position: port?.position || handle.position }, rect ? { x: handle.x - rect.left, y: handle.y - rect.top } : undefined)
+  } else if (previous) endConnection()
+})
+function moveClickConnection(event: MouseEvent) {
+  if (!connectionClickStartHandle.value) return
+  const rect = vueFlowRef.value?.getBoundingClientRect()
+  if (rect) updateConnection({ x: event.clientX - rect.left, y: event.clientY - rect.top })
+}
+function cancelClickConnection() {
+  if (!connectionClickStartHandle.value) return
+  endConnection(undefined, true)
+  endConnection()
+}
+function onCanvasClickCapture(event: MouseEvent) {
+  if (!(event.target as Element).closest('.vue-flow__handle')) cancelClickConnection()
+}
+function onConnectionKey(event: KeyboardEvent) {
+  if (event.key === 'Escape') { cancelClickConnection(); closeCtxMenu() }
+}
+function onEdgesChange(changes: EdgeChange[]) {
+  project.removeCanvasEdges(changes.filter((change) => change.type === 'remove').map((change) => change.id))
+}
+
+function onStudioWheel(event: WheelEvent) {
+  if (!event.ctrlKey) return
+  // Capture with passive:false so node editors, floating panels and zoom limits
+  // cannot fall back to browser page zoom. Plain wheel scrolling is unchanged.
+  event.preventDefault()
+  const flow = flowWrap.value?.querySelector<HTMLElement>('.vue-flow')
+  const target = event.target
+  if (!flow || !(target instanceof Element) || !flow.contains(target)) return
+  if (target.closest('.vue-flow__controls')) return
+
+  // Handle Ctrl+wheel before Vue Flow's nowheel filter (node media/editors),
+  // and prevent its own wheel handler from applying the zoom a second time.
+  event.stopPropagation()
+  const current = getViewport()
+  const zoom = Math.max(MIN_CANVAS_ZOOM, Math.min(MAX_CANVAS_ZOOM, current.zoom * 2 ** wheelDelta(event)))
+  if (zoom === current.zoom) return
+  const rect = flow.getBoundingClientRect()
+  const x = event.clientX - rect.left
+  const y = event.clientY - rect.top
+  const ratio = zoom / current.zoom
+  void setViewport({ x: x - (x - current.x) * ratio, y: y - (y - current.y) * ratio, zoom })
+}
 
 const ctxMenu = ref<{
   x: number
@@ -157,6 +332,8 @@ const ctxMenu = ref<{
   nodeId?: string
   onNode?: boolean
 } | null>(null)
+
+provide('canvasContextMenuOpen', computed(() => Boolean(ctxMenu.value)))
 
 const flowNodes = computed<Node[]>(() => {
   const graph = project.current?.canvas
@@ -169,11 +346,14 @@ const flowNodes = computed<Node[]>(() => {
         position: n.position,
         data: { ...n.data, nodeType: n.type },
         style: {
+          pointerEvents: 'none',
           width: `${n.data.width ?? 280}px`,
           height: `${n.data.height ?? 240}px`
         },
         draggable: true,
-        selectable: false,
+        selectable: n.data.kind === 'custom',
+        parentNode: n.parentGroupId,
+        expandParent: false,
         zIndex: 0
       }
     }
@@ -216,10 +396,9 @@ const flowEdges = computed<Edge[]>(() => {
     target: e.target,
     sourceHandle: e.sourceHandle,
     targetHandle: e.targetHandle,
+    type: 'connection',
     animated: false,
-    interactionWidth: 28,
-    class: 'pipe-edge',
-    style: { stroke: 'rgba(126, 180, 255, 0.42)', strokeWidth: 1.1 }
+    class: 'pipe-edge'
   }))
 })
 
@@ -230,13 +409,24 @@ const selected = computed<CanvasNode | null>(() => {
 })
 const selectedId = ref<string | null>(null)
 
+const studioSidebar = ref<InstanceType<typeof StudioSidebar>>()
+const editing = useCanvasEditing({
+  select: ids => { selectedId.value = ids.length === 1 ? ids[0] : null },
+  add: openAddMenuAtPointer,
+  search: async () => { sidebarOpen.value = true; await nextTick(); await studioSidebar.value?.focusNodeSearch() },
+  connect: connectNodes,
+  deleteEntity: deleteCtxNode
+})
+
+const contextActions = useCanvasContextActions({ nodeId: () => ctxMenu.value?.nodeId, point: () => ctxMenu.value?.flow, close: closeCtxMenu, editing })
+
 onMounted(async () => {
   if (!project.current) {
     toast.warn('请先打开项目')
     router.push('/')
     return
   }
-  agentOpen.value = true
+  window.addEventListener('wheel', onStudioWheel, { capture: true, passive: false })
   loadAgentWidth()
   const hasPipeline =
     (project.current.subjects?.length || 0) > 0 ||
@@ -252,9 +442,12 @@ onMounted(async () => {
   pullStrandedFreeformIntoView()
   await assets.refresh()
   document.querySelectorAll('body > input[type="file"]').forEach((el) => el.remove())
-  setCanvasReveal((nodeId) => {
+  setCanvasReveal((nodeId, options) => {
     setTimeout(() => {
-      if (nodeId) fitView({ nodes: [nodeId], padding: 0.28, duration: 450 })
+      if (nodeId && options?.preserveZoom) {
+        const zoom = getViewport().zoom
+        void fitView({ nodes: [nodeId], minZoom: zoom, maxZoom: zoom, duration: 450 })
+      } else if (nodeId) fitView({ nodes: [nodeId], padding: 0.28, duration: 450 })
       else fitView({ padding: 0.2, duration: 400 })
     }, 120)
   })
@@ -265,21 +458,23 @@ onMounted(async () => {
   setCanvasSelect((nodeId) => {
     selectedId.value = nodeId
   })
-  setTimeout(() => fitView({ padding: 0.2 }), 80)
-  window.addEventListener('keydown', onDupKey)
+  window.addEventListener('keydown', onConnectionKey)
   window.addEventListener('resize', clampAgentToViewport)
 })
 
 onUnmounted(() => {
   stopAgentResize()
-  window.removeEventListener('keydown', onDupKey)
+  window.removeEventListener('wheel', onStudioWheel, true)
+  window.removeEventListener('keydown', onConnectionKey)
+  cancelClickConnection()
   window.removeEventListener('resize', clampAgentToViewport)
   setCanvasReveal(null)
   setCanvasInspect(null)
   setCanvasSelect(null)
 })
 
-onConnect((c: Connection) => {
+function connectNodes(c: Connection) {
+  if (c.source === c.target) return
   if (!project.current?.canvas) return
   const source = project.current.canvas.nodes.find((node) => node.id === c.source)
   const target = project.current.canvas.nodes.find((node) => node.id === c.target)
@@ -305,55 +500,24 @@ onConnect((c: Connection) => {
     }
   ]
   project.setCanvas({ ...project.current.canvas, edges })
-})
+}
 
-onNodeDragStop(({ node }) => {
-  if (!project.current?.canvas || !node) return
-  if (node.type === 'groupFrame') {
-    const nodes = project.current.canvas.nodes.map((n) =>
-      n.id === node.id ? { ...n, position: { ...node.position } } : n
-    )
-    project.setCanvas({ ...project.current.canvas, nodes })
-    return
-  }
-  const stored = project.current.canvas.nodes.find((n) => n.id === node.id)
-  const parentId = stored?.parentGroupId
-  let position = { ...node.position }
-  let parentGroupId = parentId
-  if (parentId) {
-    const parent = project.current.canvas.nodes.find((n) => n.id === parentId)
-    const pw = Number(parent?.data.width) || 0
-    const ph = Number(parent?.data.height) || 0
-    const cx = node.position.x + NODE_W / 2
-    const cy = node.position.y + 48
-    const inside = cx >= 0 && cy >= 0 && cx <= pw && cy <= ph
-    if (!inside && parent) {
-      position = {
-        x: parent.position.x + node.position.x,
-        y: parent.position.y + node.position.y
-      }
-      parentGroupId = undefined
-    }
-  }
-  const nodes = project.current.canvas.nodes.map((n) =>
-    n.id === node.id ? { ...n, position, parentGroupId } : n
-  )
-  project.setCanvas({ ...project.current.canvas, nodes })
-})
+onConnect(connectNodes)
+onNodeDragStart(editing.startDrag)
+onNodeDrag(editing.moveDrag)
+onNodeDragStop(editing.finishDrag)
 
-onMoveEnd((ev) => {
-  const vp = ev?.flowTransform
-  if (!project.current?.canvas || !vp) return
-  project.setCanvas({
-    ...project.current.canvas,
-    viewport: { x: vp.x, y: vp.y, zoom: vp.zoom }
-  })
-})
 
 function onNodeClick(ev: { node: Node }) {
-  if (ev.node.type === 'groupFrame') return
   selectedId.value = ev.node.id
   if (ev.node.type === 'export' || ev.node.type === 'final') rightOpen.value = true
+}
+
+function onCanvasPaneClick(event: MouseEvent) {
+  selectedId.value = null
+  if (editing.pan.value || !project.current?.canvas) return
+  const frame = editing.groupAtPoint(event.clientX, event.clientY)
+  if (frame) void editing.choose([frame.id])
 }
 
 function openSettings() {
@@ -486,14 +650,14 @@ function duplicateNode(id: string | null | undefined) {
   })
 }
 
-function deleteCtxNode(id: string | null | undefined) {
+function deleteCtxNode(id: string | null | undefined, confirmed = false) {
   if (!id || !project.current) return
   const n = project.current.canvas?.nodes.find((x) => x.id === id)
   if (!n || !canDeleteNode(id)) {
     closeCtxMenu()
     return
   }
-  if (!confirm('删除这个节点？')) {
+  if (!confirmed && !confirm('删除这个节点？')) {
     closeCtxMenu()
     return
   }
@@ -537,20 +701,16 @@ function deleteCtxNode(id: string | null | undefined) {
   toast.success('已删除节点')
 }
 
-function onDupKey(e: KeyboardEvent) {
-  const t = e.target as HTMLElement | null
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
-    e.preventDefault()
-    duplicateNode(selectedId.value)
-  }
-  if (e.key === 'Delete' && canDeleteNode(selectedId.value)) {
-    e.preventDefault()
-    deleteCtxNode(selectedId.value)
-  }
+
+function openSelectionContextMenu(ev: { event: NodeMouseEvent['event']; nodes: NodeMouseEvent['node'][] }) {
+  const pt = pointerClient(ev.event)
+  if (!pt || !ev.nodes.length) return
+  const point = screenToFlowCoordinate(pt)
+  const target = ev.nodes.find(n => point.x >= n.computedPosition.x && point.y >= n.computedPosition.y && point.x <= n.computedPosition.x + n.dimensions.width && point.y <= n.computedPosition.y + n.dimensions.height) || ev.nodes[0]
+  void openCtxMenu({ event: ev.event, node: target })
 }
 
-function openCtxMenu(ev: MouseEvent | NodeMouseEvent) {
+async function openCtxMenu(ev: MouseEvent | NodeMouseEvent) {
   const event = eventFromCtx(ev)
   if (!event) return
   event.preventDefault()
@@ -558,21 +718,23 @@ function openCtxMenu(ev: MouseEvent | NodeMouseEvent) {
   const pt = pointerClient(event)
   if (!pt) return
   const flow = screenToFlowCoordinate({ x: pt.x, y: pt.y })
-  const clickedId =
-    'node' in ev && ev.node && ev.node.type !== 'groupFrame' ? String(ev.node.id) : undefined
-  if (clickedId) selectedId.value = clickedId
-  const nodeId = clickedId || selectedId.value || undefined
-  const extra = (canDuplicate(clickedId) ? 36 : 0) + (clickedId && canDeleteNode(clickedId) ? 36 : 0)
-  const extraFree = 4 * 36 + 10
-  const w = 216
-  const h = 92 + extra + extraFree
-  ctxMenu.value = {
-    x: Math.max(8, Math.min(pt.x, window.innerWidth - w - 8)),
-    y: Math.max(8, Math.min(pt.y, window.innerHeight - h - 8)),
-    flow,
-    nodeId,
-    onNode: Boolean(clickedId)
+  const clickedId = 'node' in ev && ev.node ? String(ev.node.id) : editing.groupAtPoint(pt.x, pt.y)?.id
+  if (clickedId) {
+    // Retain a multi-selection only when the clicked item belongs to it.
+    if (!getSelectedNodes.value.some(n => n.id === clickedId)) await editing.choose([clickedId])
+    selectedId.value = getSelectedNodes.value.length === 1 ? clickedId : null
   }
+  if (clickedId) {
+    ctxMenu.value = { x: pt.x, y: pt.y, flow, nodeId: clickedId, onNode: true }
+  } else {
+    showAddMenu(pt, flow)
+  }
+}
+
+function pasteAtContext() {
+  const point = ctxMenu.value?.flow
+  closeCtxMenu()
+  void editing.paste(point)
 }
 
 function closeCtxMenu() {
@@ -727,138 +889,123 @@ function goClassic() {
 </script>
 
 <template>
-  <div class="studio">
-    <header class="bar">
-      <button class="icon-btn" title="返回项目" @click="router.push('/')">
-        <CanvasToolbarIcon name="back" />
-      </button>
-      <strong>{{ project.current?.name || '画布' }}</strong>
-      <span class="dim">{{
-        `${project.current?.shots.length || 0} 个分镜 · ${project.current?.canvas?.nodes.length || 0} 个节点`
-      }}</span>
-      <span v-if="project.current?.folderPath" class="dim path" :title="project.current.folderPath">
-        {{ project.current.folderPath }}
-      </span>
-      <div class="spacer" />
-      <button class="icon-btn" title="再看一遍新手引导" @click="guideOpen = true">
-        <span class="guide-mark">?</span>
-      </button>
-      <button
-        class="mode-switch-btn script-lib-btn"
-        type="button"
-        title="打开剧本库：所有剧本都存在本地 Markdown，可以编辑、增删集数"
-        @click="router.push('/scripts')"
-      >
-        <CanvasToolbarIcon name="script" :size="15" />
-        剧本
-        <em>→</em>
-      </button>
-      <button
-        class="mode-switch-btn"
-        type="button"
-        title="切到经典分步流程：剧本 → 分镜 → 图片 → 视频 → 剪辑 → 字幕 → 导出"
-        @click="goClassic"
-      >
-        <CanvasToolbarIcon name="steps" :size="15" />
-        经典步骤
-        <em>→</em>
-      </button>
-      <button
-        class="bulk-optimize-btn"
-        type="button"
-        :disabled="optimizingAllVideos"
-        title="按分镜顺序逐个优化所有 H3 视频节点提示词"
-        @click="optimizeAllVideoPrompts"
-      >
-        <CanvasToolbarIcon name="sparkles" :size="16" />
-        {{ optimizingAllVideos ? `优化中 ${optimizeAllProgress}` : '一键优化全部视频提示词' }}
-      </button>
-      <button
-        class="icon-btn"
-        :class="{ on: agentOpen }"
-        :title="agentOpen ? '收起对话' : '打开智能体'"
-        @click="agentOpen = !agentOpen"
-      >
-        <CanvasToolbarIcon name="assistant" />
-      </button>
-      <button class="icon-btn" title="重整布局" @click="relayout">
-        <CanvasToolbarIcon name="layout" />
-      </button>
-      <button v-if="isDesktop()" class="icon-btn" title="打开文件夹" @click="openFolder">
-        <CanvasToolbarIcon name="folder" />
-      </button>
-      <button class="icon-btn" title="设置" @click="openSettings">
-        <CanvasToolbarIcon name="settings" />
-      </button>
-      <button
-        class="icon-btn"
-        :class="{ on: rightOpen }"
-        :title="rightOpen ? '收起右侧' : '打开右侧'"
-        @click="rightOpen = !rightOpen"
-      >
-        <CanvasToolbarIcon name="panel" />
-      </button>
-    </header>
+  <div ref="studioRoot" class="studio" :class="{ 'agent-is-docked': agentOpen && agentDocked }" :style="{ '--agent-dock-width': `${agentWidth}px`, '--studio-sidebar-width': `${viewportWidth > 760 ? sidebarWidth : 0}px`, '--agent-floating-width': `${agentWidth}px` }" @pointerdown="closeWorkspaceMenu">
+    <StudioSidebar
+      ref="studioSidebar"
+      v-show="sidebarOpen"
+      :key="project.current?.id"
+      :selected-id="selectedId"
+      @select="focusSidebarNode"
+      @add="openAddMenu"
+      @home="router.push('/')"
+    />
+    <CanvasGuide
+      v-if="guideOpen"
+      :sidebar-width="sidebarWidth"
+      :right-width="(agentOpen && agentDocked ? agentWidth : 0) + (rightOpen ? 300 : 0)"
+      @done="dismissGuide"
+    />
     <div class="body">
-      <CanvasGuide
-        v-if="guideOpen"
-        :agent-open="agentOpen"
-        :agent-width="agentWidth"
-        :right-width="rightOpen ? 300 : 0"
-        @done="dismissGuide"
-      />
-      <div
-        v-if="agentOpen"
-        class="agent-shell"
-        :class="{ resizing: resizingAgent }"
-        :style="{ width: `${agentWidth}px` }"
-      >
-        <AgentChat :selected-node="selected" />
-        <div
-          class="agent-resizer"
-          role="separator"
-          aria-label="调整智能体聊天窗口宽度"
-          aria-orientation="vertical"
-          :aria-valuemin="AGENT_MIN_WIDTH"
-          :aria-valuemax="maxAgentWidth()"
-          :aria-valuenow="agentWidth"
-          tabindex="0"
-          title="左右拖动调整聊天窗口宽度"
-          @pointerdown="startAgentResize"
-          @keydown.left.prevent="nudgeAgentWidth(-24)"
-          @keydown.right.prevent="nudgeAgentWidth(24)"
-          @dblclick="agentWidth = 440; persistAgentWidth()"
-        />
-      </div>
-      <div class="flow-wrap">
+      <div ref="flowWrap" class="flow-wrap" :class="{ 'agent-floating-open': agentOpen && !agentDocked, 'hand-tool': editing.pan.value, 'group-background-hover': editing.groupBackgroundHover.value, 'group-background-dragging': editing.groupBackgroundDragging.value }" @pointerdown.capture="rememberCanvasPointer($event); editing.startGroupBackgroundDrag($event)" @pointermove.capture="rememberCanvasPointer($event); editing.moveGroupBackgroundDrag($event)" @pointerup.capture="editing.endGroupBackgroundDrag" @pointercancel.capture="editing.endGroupBackgroundDrag" @pointerleave="canvasPointer = null; editing.groupBackgroundHover.value = false" @mousemove="moveClickConnection" @click.capture="onCanvasClickCapture">
+        <header class="bar" aria-label="工作区操作">
+          <button class="icon-btn" type="button" title="设置" aria-label="设置" @click="openSettings"><CanvasToolbarIcon name="settings" /></button>
+          <details ref="workspaceMenu" class="workspace-menu" @keydown.esc.stop.prevent="workspaceMenu && (workspaceMenu.open = false)">
+            <summary class="icon-btn" title="更多工作区操作" aria-label="更多工作区操作"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></summary>
+            <div class="workspace-menu-panel" @click="workspaceMenu && (workspaceMenu.open = false)">
+              <p class="workspace-menu-title" :title="project.current?.name">{{ project.current?.name || '当前项目' }}</p>
+              <button type="button" @click="router.push('/scripts')"><CanvasToolbarIcon name="script" :size="16" />剧本库</button>
+              <button type="button" @click="router.push({ name: 'generation-stats', query: { project: project.current?.id, returnTo: 'studio' } })"><CanvasToolbarIcon name="steps" :size="16" />生成统计</button>
+              <button type="button" @click="goClassic"><CanvasToolbarIcon name="steps" :size="16" />经典步骤</button>
+              <button type="button" :disabled="optimizingAllVideos" @click="optimizeAllVideoPrompts"><CanvasToolbarIcon name="sparkles" :size="16" />{{ optimizingAllVideos ? `优化中 ${optimizeAllProgress}` : '一键优化全部视频提示词' }}</button>
+              <button type="button" @click="relayout"><CanvasToolbarIcon name="layout" :size="16" />重整布局</button>
+              <button v-if="isDesktop()" type="button" @click="openFolder"><CanvasToolbarIcon name="folder" :size="16" />打开文件夹</button>
+              <button type="button" @click="guideOpen = true"><span class="guide-mark">?</span>新手引导</button>
+              <button type="button" @click="router.push('/')"><CanvasToolbarIcon name="back" :size="16" />返回项目</button>
+              <p v-if="project.current?.folderPath" class="workspace-path" :title="project.current.folderPath">{{ project.current.folderPath }}</p>
+            </div>
+          </details>
+        </header>
         <VueFlow
           :nodes="flowNodes"
           :edges="flowEdges"
+          :edge-types="edgeTypes"
+          :connect-on-click="true"
+          :selection-key-code="true"
+          :selection-mode="SelectionMode.Partial"
+          :multi-selection-key-code="['Shift', 'Control', 'Meta']"
+          :pan-on-drag="editing.pan.value ? true : [1]"
+          :nodes-draggable="!editing.pan.value"
+          :node-drag-threshold="nodeDragThreshold"
+          :nodes-connectable="!editing.pan.value"
+          :pan-on-scroll="true"
+          :zoom-on-scroll="false"
+          :zoom-on-double-click="false"
+          :delete-key-code="null"
+          @selection-end="editing.selectionEnd"
+          @edges-change="onEdgesChange"
           :node-types="(nodeTypes as any)"
-          :default-viewport="project.current?.canvas?.viewport"
-          :min-zoom="0.2"
-          :max-zoom="2"
-          fit-view-on-init
+          :default-viewport="canvasViewport.initialViewport"
+          @pane-ready="canvasViewport.ready"
+          :min-zoom="MIN_CANVAS_ZOOM"
+          :max-zoom="MAX_CANVAS_ZOOM"
+          :fit-view-on-init="false"
           @node-click="onNodeClick"
+          @edge-click="selectedId = null"
+          @pane-click="onCanvasPaneClick"
           @pane-context-menu="openCtxMenu"
           @node-context-menu="openCtxMenu"
+          @selection-context-menu="openSelectionContextMenu"
         >
           <Background :gap="22" color="rgba(255,255,255,0.08)" />
-          <Controls position="bottom-left" :show-interactive="false" />
         </VueFlow>
-        <div v-if="!project.current?.canvas?.nodes.length" class="empty-hint">
-          在左边说一句话让我开工，或在空白处右键添加图片 / 视频 / 剧本 / 角色 / 场景 / 分镜
+        <div v-if="editing.showToolbar.value && !ctxMenu" class="selection-toolbar nodrag nopan nokey" :style="editing.toolbarStyle.value" role="toolbar" aria-label="所选节点操作" @pointerdown.stop @mousedown.stop @click.stop>
+          <span class="selection-count">{{ editing.selectedGroup.value ? '组合' : `${editing.selectedIds.value.length} 个节点` }}</span>
+          <button v-if="!editing.selectedGroup.value" type="button" title="打组 Ctrl/Alt+G" @click="editing.execute('group')">▱ 打组</button>
+          <button v-if="editing.selectedGroup.value" type="button" title="解组 Ctrl/Alt+Shift+G" @click="editing.execute('ungroup')">▱ 解组</button>
+          <button type="button" title="复制节点和连线 Ctrl+D" @click="editing.execute('duplicate')">❐ 复制</button>
+          <button type="button" :disabled="editing.generating.value" title="生成所选节点 Ctrl+Enter" @click="editing.execute('generate')">▷ {{ editing.generating.value ? '生成中' : '生成' }}</button>
+          <button type="button" title="整理所选节点 Alt+Shift+F" @click="editing.execute('arrange')">▦ 整理</button>
+          <button type="button" class="selection-delete" title="删除 Del" @click="editing.execute('delete')">删除</button>
         </div>
+        <CanvasShortcutPanel v-if="editing.shortcutsOpen.value" @close="editing.shortcutsOpen.value = false" @command="editing.execute" />
+        <div v-if="!project.current?.canvas?.nodes.length" class="empty-hint">
+          点击右下角 AI 助手开始创作，或点击 ＋ / 在画布空白处右键添加节点
+        </div>
+        <div class="canvas-bottom-tools" role="toolbar" aria-label="画布工具">
+          <div class="canvas-tool-strip">
+          <button class="icon-btn sidebar-toggle" type="button" :aria-pressed="sidebarOpen" :aria-expanded="sidebarOpen" aria-controls="studio-project-sidebar" :title="sidebarOpen ? '收起节点和资源面板' : '打开节点和资源面板'" aria-label="节点和资源面板" @click="toggleSidebar"><CanvasToolbarIcon name="panel" /></button>
+          <span class="tool-divider" />
+          <button class="icon-btn add-tool" type="button" title="添加节点" aria-label="添加节点" @click="openAddMenu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18" /></svg></button>
+          <span class="tool-divider" />
+          <button class="icon-btn tool-select" type="button" :aria-pressed="editing.tool.value === 'select'" title="选择 / 框选 V" aria-label="选择工具" @click="editing.execute('select')"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m5 3 14 9-7 1-3 7Z"/></svg></button>
+          <button class="icon-btn tool-hand" type="button" :aria-pressed="editing.tool.value === 'hand'" title="抓手 H / 按住Space" aria-label="抓手工具" @click="editing.execute('hand')"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12V6a1.5 1.5 0 0 1 3 0v5-7a1.5 1.5 0 0 1 3 0v7-6a1.5 1.5 0 0 1 3 0v7-4a1.5 1.5 0 0 1 3 0v7c0 5-3 7-7 7-3 0-5-2-7-5l-2-3a1.5 1.5 0 0 1 2-2l2 2Z"/></svg></button>
+          <button class="icon-btn" type="button" title="适应全部节点" aria-label="适应全部节点" @click="fitView({ padding: 0.2, duration: 300 })"><CanvasToolbarIcon name="expand" /></button>
+          <button class="icon-btn shortcut-toggle" type="button" :aria-expanded="editing.shortcutsOpen.value" title="画布快捷键" aria-label="画布快捷键" @click="editing.shortcutsOpen.value = !editing.shortcutsOpen.value"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M6 9h1m4 0h1m4 0h1M6 12h1m4 0h1m4 0h1M7 16h10"/></svg></button>
+          <button class="icon-btn" type="button" title="画布使用帮助" aria-label="画布使用帮助" @click="guideOpen = true"><span class="guide-mark">?</span></button>
+          </div>
+        </div>
+        <div class="canvas-zoom" role="toolbar" aria-label="画布缩放">
+          <button class="icon-btn" type="button" aria-label="缩小画布" title="缩小画布" :disabled="zoomPercent <= 20" @click="zoomOut({ duration: 150 })">−</button>
+          <button class="zoom-value" type="button" aria-label="重置画布为100%" title="重置为100%" @click="setViewport({ ...getViewport(), zoom: 1 }, { duration: 200 })">{{ zoomPercent }}%</button>
+          <button class="icon-btn" type="button" aria-label="放大画布" title="放大画布" :disabled="zoomPercent >= 200" @click="zoomIn({ duration: 150 })">＋</button>
+        </div>
+        <button v-show="!agentOpen" ref="agentToggle" class="agent-toggle" :class="{ on: agentOpen, busy: agentBusy }" type="button" :aria-expanded="agentOpen" aria-controls="studio-agent-dialog" :aria-label="agentOpen ? '收起 AI 助手' : '打开 AI 助手'" @click="toggleAgent">
+          <AgentOrb :size="28" variant="launcher" :active="agentOpen" :busy="agentBusy" :paused="agentOpen" /><span class="agent-tooltip">剧流 AI 导演</span><i v-if="agentBusy" class="activity-dot" />
+        </button>
+        <div ref="agentFloatHost" class="agent-float-host" />
       </div>
+      <CanvasContextDialog v-if="contextActions.subjectDraft.value || contextActions.verification.value" :draft="contextActions.subjectDraft.value" :verification="contextActions.verification.value" :busy="contextActions.busy.value" @close="contextActions.subjectDraft.value = undefined; contextActions.verification.value = undefined" @submit="contextActions.saveSubject" />
       <Teleport to="body">
+        <CanvasNodeContextMenu v-if="ctxMenu?.onNode && contextActions.node.value" :key="ctxMenu.nodeId" :x="ctxMenu.x" :y="ctxMenu.y" :label="contextActions.group.value ? '组合' : contextActions.node.value.type === 'videoGen' ? '视频节点' : '图片节点'" :rating="contextActions.rating.value" :show-rating="contextActions.group.value || ['imageGen','videoGen'].includes(contextActions.node.value.type)" :busy="contextActions.busy.value" :items="contextActions.items.value" @close="closeCtxMenu" @action="contextActions.action" @rate="contextActions.rate" />
         <div
-          v-if="ctxMenu"
+          v-if="ctxMenu && !ctxMenu.onNode"
           class="ctx-mask"
           @click="closeCtxMenu"
           @contextmenu.prevent="openCtxMenu"
         />
         <div
-          v-if="ctxMenu"
+          v-if="ctxMenu && !ctxMenu.onNode"
+          ref="blankContextMenu"
           class="ctx-menu"
           :style="{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }"
           @mousedown.stop
@@ -909,6 +1056,8 @@ function goClassic() {
             </svg>
             {{ ctxMenu.nodeId ? '追加分镜节点' : '添加分镜节点' }}
           </button>
+          <div class="ctx-sep" />
+          <button type="button" @click="pasteAtContext">粘贴节点 <span style="margin-left:auto;color:var(--color-text-3);font-size:11px">Ctrl+V</span></button>
           <template v-if="ctxMenu.onNode && (canDuplicate(ctxMenu.nodeId) || canDeleteNode(ctxMenu.nodeId))">
             <div class="ctx-sep" />
             <button
@@ -940,35 +1089,62 @@ function goClassic() {
         </div>
       </Teleport>
       <aside v-if="rightOpen" class="dock">
-        <div class="dock-title">节点</div>
+        <div class="dock-title"><span>节点</span><button class="icon-btn" type="button" title="收起节点检查器" aria-label="收起节点检查器" @click="rightOpen = false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6" /></svg></button></div>
         <NodeInspector :node="selected" />
       </aside>
     </div>
+    <div ref="agentDockHost" v-show="agentOpen && agentDocked" class="agent-dock-host" />
+    <Teleport v-if="agentFloatHost && agentDockHost" :to="agentDocked ? agentDockHost : agentFloatHost">
+        <section
+          v-show="agentOpen"
+          id="studio-agent-dialog"
+          class="agent-shell"
+          :class="{ resizing: resizingAgent, docked: agentDocked }"
+          :style="{ width: `${agentWidth}px` }"
+          role="region"
+          aria-label="AI 助手对话"
+        >
+          <AgentChat :key="project.current?.id" :selected-node="selected" :active="agentOpen" :docked="agentDocked" @dock="toggleAgentDock" @close="closeAgent" @activity="agentBusy = $event" />
+          <div
+            class="agent-resizer"
+            role="separator"
+            aria-label="调整 AI 对话框宽度"
+            aria-orientation="vertical"
+            :aria-valuemin="Math.min(AGENT_MIN_WIDTH, maxAgentWidth())"
+            :aria-valuemax="maxAgentWidth()"
+            :aria-valuenow="agentWidth"
+            tabindex="0"
+            title="拖动左边缘调整对话框宽度"
+            @pointerdown="startAgentResize"
+            @keydown.left.prevent="nudgeAgentWidth(24)"
+            @keydown.right.prevent="nudgeAgentWidth(-24)"
+            @dblclick="agentWidth = clampAgentWidth(440); persistAgentWidth()"
+          />
+        </section>
+    </Teleport>
   </div>
 </template>
 
 <style scoped>
-.studio {
-  height: 100%;
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  background: var(--color-bg-0);
-  min-width: 0;
-}
-.bar {
-  height: 46px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-1);
-  font-size: 13px;
-  min-width: 0;
-  -webkit-app-region: drag;
-  app-region: drag;
-}
+.studio { height:100%; width:100%; display:grid; grid-template-columns:var(--studio-sidebar-width,300px) minmax(0,1fr) 0px; grid-template-rows:minmax(0,1fr); position:relative; background:var(--color-bg-0); min-width:0; min-height:0; overflow:hidden; }
+.studio.agent-is-docked { grid-template-columns:var(--studio-sidebar-width,300px) minmax(0,1fr) var(--agent-dock-width); }
+.studio > .studio-sidebar { grid-column:1; grid-row:1; }
+.studio > .body { grid-column:2; grid-row:1; min-width:0; }
+.agent-dock-host { grid-column:3; grid-row:1; position:relative; min-width:0; min-height:0; border-left:1px solid var(--color-border-strong); background:var(--color-bg-1); }
+.bar { position:absolute; top:12px; z-index:10; display:flex; align-items:center; gap:3px; padding:3px; border:1px solid var(--color-border); border-radius:10px; background:color-mix(in srgb,var(--color-bg-1) 94%,transparent); box-shadow:var(--shadow-sm); backdrop-filter:blur(14px); }
+.bar { right:12px; }
+.bar > .icon-btn,.workspace-menu > summary { width:28px; height:28px; }
+.workspace-menu { position:relative; }
+.workspace-menu > summary { list-style:none; }
+.workspace-menu > summary::-webkit-details-marker { display:none; }
+.workspace-menu[open] > summary { background:var(--color-fill-hover); }
+.workspace-menu-panel { position:absolute; right:0; top:calc(100% + 9px); width:min(248px,calc(100vw - 36px)); box-sizing:border-box; padding:6px; border:1px solid var(--color-border-strong); border-radius:12px; background:var(--color-bg-1); box-shadow:var(--shadow-lg); max-height:calc(100dvh - 80px); overflow:auto; }
+.workspace-menu-panel > button { width:100%; display:flex; align-items:center; gap:10px; border:0; border-radius:7px; padding:9px; color:var(--color-text-2); background:transparent; font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.workspace-menu-panel > button:hover { background:var(--color-fill-hover); color:var(--color-text-1); }
+.workspace-menu-panel > button:disabled { opacity:.5; cursor:wait; }
+.workspace-menu-title,.workspace-path { padding:7px 9px; margin:0; color:var(--color-text-4); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.workspace-menu-title { border-bottom:1px solid var(--color-border); margin-bottom:4px; color:var(--color-text-2); }
+.icon-btn { width:28px; height:28px; }
 .bar .dim {
   color: var(--color-text-4);
   font-size: 11px;
@@ -1018,71 +1194,6 @@ function goClassic() {
   background: var(--color-bg-3);
   color: var(--color-accent);
 }
-.mode-switch-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 11px;
-  border: 1px solid rgba(126, 180, 255, 0.42);
-  border-radius: 7px;
-  background: linear-gradient(135deg, rgba(126, 180, 255, 0.18), rgba(167, 139, 250, 0.14));
-  color: #cbd8ff;
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-  flex-shrink: 0;
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
-  transition: all 0.15s;
-}
-.mode-switch-btn svg {
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.mode-switch-btn em {
-  font-style: normal;
-  opacity: 0.7;
-}
-.mode-switch-btn:hover {
-  border-color: rgba(126, 180, 255, 0.75);
-  background: linear-gradient(135deg, rgba(126, 180, 255, 0.28), rgba(167, 139, 250, 0.2));
-  color: #eaf0ff;
-}
-.script-lib-btn {
-  border-color: rgba(167, 139, 250, 0.5);
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.2), rgba(126, 180, 255, 0.14));
-  color: #ddd6fe;
-}
-.script-lib-btn:hover {
-  border-color: rgba(167, 139, 250, 0.85);
-  background: linear-gradient(135deg, rgba(167, 139, 250, 0.34), rgba(126, 180, 255, 0.22));
-  color: #f3efff;
-}
-.bulk-optimize-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 10px;
-  border: 1px solid color-mix(in srgb, var(--color-accent) 38%, var(--color-border));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-bg-1));
-  color: var(--color-text-1);
-  font-size: 11px;
-  white-space: nowrap;
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
-}
-.bulk-optimize-btn:hover:not(:disabled) {
-  border-color: var(--color-accent);
-  background: color-mix(in srgb, var(--color-accent) 16%, var(--color-bg-1));
-}
-.bulk-optimize-btn:disabled { opacity: .65; cursor: wait; }
 .empty-hint {
   position: absolute;
   inset: 0;
@@ -1092,6 +1203,8 @@ function goClassic() {
   pointer-events: none;
   color: var(--color-text-4);
   font-size: 13px;
+  padding: 24px;
+  text-align: center;
   letter-spacing: 0.04em;
 }
 .ctx-mask {
@@ -1165,6 +1278,9 @@ function goClassic() {
   min-height: 0;
 }
 .dock-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
   font-size: 12px;
@@ -1195,98 +1311,86 @@ function goClassic() {
   font-weight: 700;
   line-height: 1;
 }
-.agent-shell {
-  position: relative;
-  flex: 0 0 auto;
-  min-width: 300px;
-  max-width: min(760px, calc(100vw - 360px));
-  min-height: 0;
-  z-index: 4;
+.canvas-bottom-tools { position:absolute; bottom:max(12px,env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); display:flex; align-items:center; max-width:calc(100% - 24px); z-index:9; }
+.canvas-tool-strip { display:flex; align-items:center; gap:3px; padding:3px; border:1px solid var(--color-border-strong); border-radius:11px; background:color-mix(in srgb,var(--color-bg-1) 94%,transparent); box-shadow:0 4px 20px #0003,0 1px 2px #0002; backdrop-filter:blur(14px); }
+.canvas-tool-strip .icon-btn { width:28px; height:28px; border-radius:7px; }
+.tool-divider { width:1px; height:16px; background:var(--color-border); flex-shrink:0; margin-inline:1px; }
+.add-tool { background:var(--color-text-1); color:var(--color-bg-1); }
+.add-tool:hover { background:var(--color-text-2); color:var(--color-bg-1); }
+.agent-toggle { position:absolute; right:max(12px,env(safe-area-inset-right)); bottom:max(12px,env(safe-area-inset-bottom)); z-index:9; display:grid; place-items:center; flex-shrink:0; width:40px; height:40px; padding:0; border:1px solid #94d6dd36; border-radius:50%; background:linear-gradient(145deg,#253238,#151c23 70%); box-shadow:inset 0 1px 1px #dbffff12,0 4px 18px #0005; isolation:isolate; cursor:pointer; transition:box-shadow .25s,transform .25s,border-color .25s; }
+/* Soft glow breathes outside the button while a fine highlight travels around its rim. */
+.agent-toggle::before,.agent-toggle::after { content:''; position:absolute; border-radius:50%; pointer-events:none; }
+.agent-toggle::before { inset:-9px; z-index:-1; background:radial-gradient(circle,#32e8dc38 16%,#1ccfdd20 42%,transparent 70%); opacity:.45; animation:agent-launcher-breathe 4.8s ease-in-out infinite; }
+.agent-toggle::after { inset:-1px; padding:1px; background:conic-gradient(from 0deg,transparent 0deg,#87fff257 35deg,#d3fffbe6 64deg,#43e7ec87 84deg,transparent 120deg,transparent 215deg,#8da9ff75 255deg,transparent 292deg); -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0); mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0); -webkit-mask-composite:xor; mask-composite:exclude; opacity:.7; animation:agent-launcher-orbit 9s linear infinite; }
+.agent-toggle:hover,.agent-toggle:focus-visible { transform:translateY(-2px) scale(1.06); border-color:#80f4e880; box-shadow:inset 0 1px 1px #dbffff26,0 5px 22px #19cbd438,0 0 18px #48e8e01f; }
+.agent-toggle:hover::after,.agent-toggle:focus-visible::after { opacity:1; animation-duration:4.5s; }
+.agent-toggle:active { transform:translateY(0) scale(.96); transition-duration:.12s; }
+.agent-toggle.busy { border-color:#74f4e18c; }
+.agent-toggle.busy::before { animation-duration:2.4s; }
+.agent-toggle.busy::after { opacity:1; animation-duration:2.6s; }
+.agent-toggle[aria-expanded=true]::before,.agent-toggle[aria-expanded=true]::after { animation-play-state:paused; }
+.agent-toggle:focus-visible { outline:2px solid #8bf7ee; outline-offset:5px; }
+@keyframes agent-launcher-breathe { 0%,100% { transform:scale(.86); opacity:.35; } 50% { transform:scale(1.15); opacity:.8; } }
+@keyframes agent-launcher-orbit { to { transform:rotate(360deg); } }
+.agent-tooltip { position:absolute; bottom:calc(100% + 10px); right:0; transform:translateY(4px); padding:6px 10px; border:1px solid var(--color-border); border-radius:8px; background:var(--color-bg-1); color:var(--color-text-1); font-size:11px; font-weight:500; white-space:nowrap; opacity:0; visibility:hidden; pointer-events:none; transition:opacity .15s,transform .15s; box-shadow:0 4px 12px #0003; }
+.agent-toggle:hover .agent-tooltip,.agent-toggle:focus-visible .agent-tooltip { opacity:1; visibility:visible; transform:translateY(0); }
+.activity-dot { position:absolute; right:0; top:1px; width:7px; height:7px; border:2px solid var(--color-bg-1); border-radius:50%; background:#55e6c1; }
+.agent-shell { position:absolute; right:max(12px,env(safe-area-inset-right)); bottom:max(12px,env(safe-area-inset-bottom)); box-sizing:border-box; height:min(520px,calc(100% - 72px)); max-width:calc(100% - 24px); min-width:0; min-height:0; z-index:8; border:1px solid var(--color-border-strong); border-radius:24px; background:var(--color-bg-1); box-shadow:0 12px 56px #0005,0 1px 4px #0003; }
+.agent-shell.docked { position:relative; inset:auto; width:100% !important; max-width:none; height:100%; border:0; border-radius:0; box-shadow:none; }
+.agent-shell :deep(.agent) { width:100%; height:100%; border:none; border-radius:inherit; }
+.agent-resizer { position: absolute; top: 14px; left: -5px; bottom: 14px; width: 10px; z-index: 8; cursor: col-resize; touch-action: none; outline: none; }
+.agent-resizer::after { content: ''; position: absolute; inset: 0 auto 0 4px; width: 2px; background: transparent; transition: background .15s; }
+.agent-resizer:hover::after, .agent-resizer:focus-visible::after, .agent-shell.resizing .agent-resizer::after { background: var(--color-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 16%, transparent); }
+@media (prefers-reduced-motion:reduce) {
+  .agent-toggle,.agent-tooltip { transition:none; }
+  .agent-toggle::before,.agent-toggle::after { animation:none; }
+  .agent-toggle::before { opacity:.4; }
+  .agent-toggle:hover,.agent-toggle:focus-visible,.agent-toggle:active { transform:none; }
 }
-.agent-shell :deep(.agent) {
-  width: 100%;
-  height: 100%;
-  border-right: 1px solid var(--color-border);
+@media (max-width: 1000px) {
+  .dock { position: absolute; right: 0; top: 0; bottom: 80px; z-index: 10; border-bottom: 1px solid var(--color-border); border-radius: 0 0 0 12px; box-shadow: -8px 0 30px #0004; }
 }
-.agent-resizer {
-  position: absolute;
-  top: 0;
-  right: -5px;
-  bottom: 0;
-  width: 10px;
-  z-index: 8;
-  cursor: col-resize;
-  touch-action: none;
-  outline: none;
-}
-.agent-resizer::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 4px;
-  width: 2px;
-  background: transparent;
-  transition: background 0.15s ease, box-shadow 0.15s ease;
-}
-.agent-resizer:hover::after,
-.agent-resizer:focus-visible::after,
-.agent-shell.resizing .agent-resizer::after {
-  background: var(--color-accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 16%, transparent);
+@media (max-width:760px) {
+  .studio.agent-is-docked { grid-template-columns:0px minmax(0,1fr) 0px; }
+  .agent-dock-host { grid-column:1 / -1; grid-row:1 / -1; position:absolute; inset:0 0 0 auto; width:min(100%,var(--agent-dock-width)); z-index:40; box-shadow:-8px 0 30px #0004; }
+  .studio > .studio-sidebar { grid-column:1 / -1; grid-row:1 / -1; position:absolute; inset:0 auto 60px 0; height:auto; z-index:30; }
 }
 .flow-wrap {
   flex: 1;
   min-width: 0;
   position: relative;
+  container-type:inline-size;
 }
 .flow-wrap :deep(.vue-flow) {
   background: var(--color-canvas);
 }
-.flow-wrap :deep(.vue-flow__controls) {
-  display: flex;
-  flex-direction: row;
-  gap: 2px;
-  margin: 12px;
-  padding: 4px;
-  border-radius: 10px;
-  border: 1px solid var(--color-border);
-  background: var(--color-bg-1);
-  box-shadow: var(--shadow-md);
+.canvas-zoom { position:absolute; left:12px; bottom:max(12px,env(safe-area-inset-bottom)); z-index:9; display:flex; align-items:center; gap:2px; padding:3px; border:1px solid var(--color-border); border-radius:10px; background:var(--color-bg-1); box-shadow:var(--shadow-sm); }
+.agent-floating-open .canvas-zoom { bottom:56px; }
+.canvas-zoom .icon-btn { width:26px; height:26px; font-size:17px; }
+.canvas-zoom .icon-btn:disabled { opacity:.3; cursor:default; }
+.zoom-value { min-width:48px; height:26px; padding:0 4px; border:0; border-radius:6px; background:transparent; color:var(--color-text-2); font:inherit; font-size:11px; cursor:pointer; }
+.zoom-value:hover { background:var(--color-fill-hover); }
+@container (min-width:901px) {
+  .agent-floating-open .canvas-bottom-tools { left:calc((100% - var(--agent-floating-width)) / 2); }
 }
-.flow-wrap :deep(.vue-flow__controls-button) {
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: none;
-  border-bottom: none;
-  border-radius: 8px;
-  background: transparent;
-  box-sizing: border-box;
+@container (max-width:900px) {
+  .agent-shell:not(.docked) { bottom:60px; height:min(520px,calc(100% - 120px)); }
+  .canvas-tool-strip { gap:2px; }
 }
-.flow-wrap :deep(.vue-flow__controls-button svg) {
-  max-width: 14px;
-  max-height: 14px;
-  fill: var(--color-text-2);
+@container (max-width:600px) {
+  .canvas-zoom { bottom:56px; }
+  .agent-floating-open .canvas-zoom { display:none; }
+  .canvas-bottom-tools { max-width:calc(100% - 72px); left:12px; right:60px; width:max-content; margin-inline:auto; transform:none; }
+  .canvas-tool-strip { gap:1px; padding:3px; }
+  .canvas-tool-strip .icon-btn { width:27px; height:28px; }
 }
-.flow-wrap :deep(.vue-flow__controls-button:hover) {
-  background: var(--color-fill-hover);
-}
-.flow-wrap :deep(.vue-flow__controls-button:hover svg) {
-  fill: var(--color-text-1);
-}
-.flow-wrap :deep(.vue-flow__controls-button:disabled) {
-  opacity: 0.35;
-}
+
 .flow-wrap :deep(.vue-flow__node) {
   overflow: visible !important;
   padding: 0;
   background: transparent;
   border: none;
   box-shadow: none;
-}
-.flow-wrap :deep(.vue-flow__node.selected) {
-  z-index: 12 !important;
 }
 .flow-wrap :deep(.vue-flow__node-groupFrame) {
   overflow: visible !important;
@@ -1309,27 +1413,22 @@ function goClassic() {
   width: auto;
   height: auto;
 }
-.flow-wrap :deep(.vue-flow__edge-path) {
-  stroke: rgba(126, 180, 255, 0.42) !important;
-  stroke-width: 1.1 !important;
-  transition: stroke 0.16s ease, stroke-width 0.16s ease, filter 0.16s ease;
+.flow-wrap :deep(.vue-flow__connection-path) {
+  stroke:var(--color-text-2);
+  stroke-width:1.4;
+  opacity:.8;
+  vector-effect:non-scaling-stroke;
 }
-.flow-wrap :deep(.vue-flow__edge.pipe-edge:hover),
-.flow-wrap :deep(.vue-flow__edge:hover) {
-  z-index: 20;
-}
-.flow-wrap :deep(.vue-flow__edge:hover .vue-flow__edge-path) {
-  stroke: #9cc4ff !important;
-  stroke-width: 2.4 !important;
-  filter: none;
-}
-.flow-wrap :deep(.vue-flow__edge .vue-flow__edgeupdater),
-.flow-wrap :deep(.vue-flow__edge-interaction) {
-  stroke-width: 28px;
-  stroke: transparent;
-}
-.flow-wrap :deep(.vue-flow__connection-line) {
-  stroke: rgba(126, 180, 255, 0.55) !important;
-  stroke-width: 1.4 !important;
-}
+.selection-toolbar { position:absolute; z-index:30; display:flex; align-items:center; gap:3px; padding:6px; box-sizing:border-box; max-width:calc(100% - 16px); border:1px solid var(--color-border); border-radius:12px; background:var(--color-bg-1); box-shadow:0 5px 22px #0004; white-space:nowrap; }
+.selection-toolbar button { border:0; border-radius:7px; background:transparent; color:var(--color-text-1); padding:7px 9px; font:inherit; font-size:11px; cursor:pointer; }
+.selection-toolbar button:hover { background:var(--color-bg-3); }
+.selection-toolbar button:disabled { opacity:.4; cursor:default; }
+.selection-toolbar .selection-delete { color:var(--color-text-3); }
+.selection-count { color:var(--color-text-3); padding:0 8px; font-size:10px; border-right:1px solid var(--color-border); }
+.canvas-bottom-tools .icon-btn[aria-pressed=true] { background:var(--color-bg-3); color:var(--color-accent); }
+.flow-wrap :deep(.vue-flow__selection), .flow-wrap :deep(.vue-flow__nodesselection-rect) { background:color-mix(in srgb,var(--color-accent) 7%,transparent); border:1px dashed var(--color-accent); border-radius:6px; }
+.group-background-hover :deep(.vue-flow__pane) { cursor:grab; }
+.group-background-dragging, .group-background-dragging :deep(.vue-flow__pane) { cursor:grabbing; }
+.hand-tool :deep(.vue-flow__pane), .hand-tool :deep(.vue-flow__node) { cursor:grab !important; }
+.hand-tool :deep(.vue-flow__pane.dragging) { cursor:grabbing !important; }
 </style>

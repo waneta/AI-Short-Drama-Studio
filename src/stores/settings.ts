@@ -9,6 +9,7 @@ import { ref, watch } from 'vue'
 import { applyStartupVideoProfile } from '@/services/settings/startupVideoProfile'
 import { applyStartupImageProfile, retireUninstalledImageProfiles } from '@/services/settings/startupImageProfile'
 import { repairImageEndpoint, repairImageProfiles } from '@/services/settings/repairImageProfiles'
+import { missingAutodlProfiles } from '@/services/ai/autodl'
 import { envDefaults, migrateVideoBaseUrl, migrateVideoWorkflowId } from '@/services/ai/env'
 import { desktop, isDesktop } from '@/services/desktop'
 import { stillModeForVideoModel, type VideoGenModel, type VideoStillMode } from '@/types/canvas'
@@ -81,6 +82,10 @@ export interface VideoProfile extends VideoEndpoint {
 }
 
 export interface AppSettings {
+  /** Shared text/agent engine; old installations keep API mode. */
+  assistantEngine: 'api' | 'codex'
+  codexModel: string
+  codexEffort: string
   theme: 'dark' | 'light'
   aiMode: AIMode
   debug: boolean
@@ -404,6 +409,9 @@ function buildDefaults(): AppSettings {
   const musicFirst = profileFromEndpoint(music, '默认配乐', newId('mus'))
   return {
     theme: 'dark',
+    assistantEngine: 'api',
+    codexModel: '',
+    codexEffort: '',
     aiMode: 'real',
     debug: false,
     defaultAspectRatio: '16:9',
@@ -501,6 +509,8 @@ function parseSettings(raw: string | null): AppSettings {
       video.list.find((profile) => isAutodlVideoProfile(profile))?.apiKey ||
       ''
     ).trim()
+    // Add requested workflows once using the saved Token; keep the current route and all existing entries.
+    video.list.push(...missingAutodlProfiles(video.list, autodlToken))
     const music = hydrateNamed(
       parsed.musics,
       {
@@ -516,6 +526,9 @@ function parseSettings(raw: string | null): AppSettings {
     return {
       ...defaults,
       ...parsed,
+      assistantEngine: parsed.assistantEngine === 'codex' ? 'codex' : 'api',
+      codexModel: typeof parsed.codexModel === 'string' ? parsed.codexModel : '',
+      codexEffort: typeof parsed.codexEffort === 'string' && ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(parsed.codexEffort) ? parsed.codexEffort : '',
       theme: 'dark',
       aiMode: 'real',
       llm: llm.active,

@@ -4,19 +4,19 @@ import type { GenerationRecord } from '@/types'
 /** Whitelist generation facts; never persist endpoints, authentication, headers or whole profiles. */
 export function generationRecord(kind: 'image' | 'video', cfg: { id?: string; name?: string; model?: string; workflowId?: string; provider?: string; adapter?: { type?: string } }, input: {
   prompt: string; width: number; height: number; aspectRatio?: string; seed?: number;
-  style?: string; duration?: number; videoResolution?: string; h3Resolution?: string; videoAudioEnabled?: boolean;
+  quality?: string; style?: string; duration?: number; videoResolution?: string; h3Resolution?: string; videoAudioEnabled?: boolean; shotAudioMode?: import('@/types').ShotAudioMode;
   referenceAudio?: { assetId?: string; filename?: string };
   referenceAudios?: Array<{ assetId?: string; filename?: string }>;
   referenceBindings?: VideoReferenceBinding[];
-  h3GenMode?: string; videoModel?: string; referenceImages?: Blob[]; imageBlob?: Blob; lastFrameBlob?: Blob
+  h3GenMode?: string; videoGenerationMode?: string; videoModel?: string; referenceImages?: Blob[]; imageBlob?: Blob; lastFrameBlob?: Blob
 }): GenerationRecord {
-  return { version: 1, kind, createdAt: Date.now(), profileId: cfg.id, profileName: cfg.name,
+  return { version: 1, runId: `gen_${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`, outputCount: 1, kind, createdAt: Date.now(), profileId: cfg.id, profileName: cfg.name,
     model: cfg.model || cfg.workflowId || input.videoModel || '未记录', provider: cfg.provider,
     adapter: cfg.adapter?.type, prompt: input.prompt, userPrompt: kind === 'video' ? displayVideoReferenceTokens(input.prompt, input.referenceBindings || []) : input.prompt,
     requestedWidth: input.width, requestedHeight: input.height, aspectRatio: input.aspectRatio,
     resolution: kind === 'image' ? input.h3Resolution : input.videoResolution,
-    seed: input.seed, style: input.style, duration: input.duration,
-    mode: input.h3GenMode, audioEnabled: input.videoAudioEnabled,
+    quality: input.quality, seed: input.seed, style: input.style, duration: input.duration,
+    mode: input.videoGenerationMode || input.h3GenMode, shotAudioMode: input.shotAudioMode, audioEnabled: input.videoAudioEnabled,
     referenceAudio: input.referenceAudio ? { ...input.referenceAudio } : undefined,
     referenceAudios: input.referenceAudios?.map(item => ({ ...item })),
     referenceCount: (input.referenceImages?.length || 0) + (input.imageBlob ? 1 : 0) + (input.lastFrameBlob ? 1 : 0) }

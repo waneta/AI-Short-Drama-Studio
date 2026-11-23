@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useProjectStore, useSettingsStore, uniqueProfileName } from '@/stores'
+import { computed, ref, watch } from 'vue'
+import { useProjectStore, useSettingsStore, uniqueProfileName, endpointReady } from '@/stores'
 import { compatibleVoice, voicesForModel } from '@/services/ai/tts'
 import EndpointForm from '@/components/settings/EndpointForm.vue'
 import AdapterFields from '@/components/settings/AdapterFields.vue'
 import ComfyQuickAdd from '@/components/settings/ComfyQuickAdd.vue'
 import ProfileLibrary from '@/components/settings/ProfileLibrary.vue'
+import CodexSettings from '@/components/settings/CodexSettings.vue'
 import type { AdapterConfig } from '@/services/ai/adapters'
 import { type VideoStillMode } from '@/types/canvas'
 import { syncH3ShotStillModes } from '@/services/canvas/videoModel'
@@ -17,6 +18,7 @@ import {
   VISION_PROVIDERS,
   applyProviderPreset,
   findProvider,
+  matchProviderId,
   type ProviderPreset
 } from '@/services/ai/providers'
 
@@ -27,6 +29,18 @@ defineProps<{
 const settings = useSettingsStore()
 const project = useProjectStore()
 const showVideoKey = ref(false)
+const apiSaving = ref(false), apiNotice = ref(''), apiError = ref('')
+watch(() => settings.config.llm, () => { apiNotice.value = ''; apiError.value = '' }, { deep: true, flush: 'sync' })
+async function applyLlm() {
+  if (apiSaving.value) return
+  apiSaving.value = true; apiNotice.value = ''; apiError.value = ''
+  try {
+    if (!endpointReady(settings.config.llm)) throw new Error('请补全接口地址、API Key 和模型名称。')
+    await settings.flush()
+    apiNotice.value = '配置已保存，可以回到画布使用。尚未发送模型请求验证接口。'
+  } catch (e: any) { apiError.value = e.message }
+  finally { apiSaving.value = false }
+}
 
 const llmName = computed({
   get: () => settings.config.llms.find((p) => p.id === settings.config.activeLlmId)?.name ?? '',
@@ -56,6 +70,11 @@ const videoWorkflow = computed({
   get: () => settings.config.video.workflowId,
   set: (v: string) => settings.patchVideo({ workflowId: v })
 })
+const videoCommonModels = computed(() => {
+  const profile = settings.config.video
+  const preset = findProvider(profile.provider || matchProviderId(profile.baseUrl, VIDEO_PROVIDERS), VIDEO_PROVIDERS)
+  return preset.id === 'dashscope-token-plan' ? preset.models : []
+})
 const videoKey = computed({
   get: () => settings.config.video.apiKey,
   set: (v: string) => settings.patchVideo({ apiKey: v })
@@ -65,6 +84,13 @@ const ttsVoice = computed({
   get: () => compatibleVoice(settings.config.tts.model, settings.config.tts.voice),
   set: (v: string) => onVoice(v)
 })
+
+function patchTtsEndpoint(patch: Parameters<typeof settings.patchTts>[0]) {
+  const changingProvider = patch.provider && patch.provider !== settings.config.tts.provider
+  settings.patchTts({ ...patch,
+    ...(patch.model ? { voice: compatibleVoice(patch.model, settings.config.tts.voice) } : {}),
+    ...(changingProvider ? { apiKey: '' } : {}) })
+}
 
 function onVoice(v: string) {
   settings.patchTts({ voice: v })
@@ -97,7 +123,8 @@ function createNamed(
     apiKey: '',
     model: applied.model,
     models: applied.models,
-    provider: applied.provider
+    provider: applied.provider,
+    ...(kind === 'tts' ? { voice: compatibleVoice(applied.model) } : {})
   }
   if (kind === 'llm') settings.addLlm(seed)
   else if (kind === 'vision') settings.addVision(seed)
@@ -142,9 +169,14 @@ function patchAdapter(
 <template>
   <div class="mods">
     <template v-if="module === 'llm'">
+      <CodexSettings />
+      <section v-if="settings.config.assistantEngine !== 'codex'" class="llm-api-settings">
+      <div class="llm-api-actions"><button type="button" data-action="apply-api" :disabled="apiSaving" @click="applyLlm">{{ apiSaving ? '保存中…' : '保存 API 配置' }}</button><span>字段自动保存在本机，点击按钮检查是否填全。</span></div>
+      <p v-if="apiNotice" role="status" class="llm-api-notice">{{ apiNotice }}</p><p v-if="apiError" role="alert" class="llm-api-error">{{ apiError }}</p>
+      <div class="llm-api-layout"><aside class="llm-profiles">
       <ProfileLibrary
         title="已保存的语言模型"
-        hint="每种接入保存成一项。同一项下面可加多个模型名，智能体和写剧本时就能切换。"
+        hint="选择已有接入，或添加新的厂商接口。"
         :profiles="settings.config.llms.map((p) => ({ id: p.id, name: p.name, subtitle: subtitle(p) }))"
         :active-id="settings.config.activeLlmId"
         :providers="LLM_PROVIDERS"
@@ -158,9 +190,10 @@ function patchAdapter(
         v-model="llmName"
         placeholder="例如 DeepSeek 官方"
       />
+      </aside><div class="llm-connection">
       <EndpointForm
-        title="API 接入"
-        hint="写剧本、提炼分镜、智能体对话都走这一套。不懂选哪个，就在设置页的「接入助手」里把厂商给的信息贴给它。"
+        title="连接信息"
+        compact
         :presets="LLM_PROVIDERS"
         :base-url="settings.config.llm.baseUrl"
         :api-key="settings.config.llm.apiKey"
@@ -171,11 +204,12 @@ function patchAdapter(
         @add-model="settings.addModel('llm', $event)"
         @remove-model="settings.removeModel('llm', $event)"
       />
-      <AdapterFields
+      <details class="llm-advanced"><summary>高级设置 · 请求适配</summary><AdapterFields
         kind="llm"
         :adapter="settings.config.llm.adapter"
         @patch="patchAdapter('llm', $event)"
-      />
+      /></details>
+      </div></div></section>
     </template>
 
     <template v-else-if="module === 'vision'">
@@ -282,7 +316,7 @@ function patchAdapter(
         :model="settings.config.tts.model"
         :models="settings.config.tts.models"
         :provider="settings.config.tts.provider"
-        @patch="settings.patchTts($event)"
+        @patch="patchTtsEndpoint"
         @add-model="settings.addModel('tts', $event)"
         @remove-model="settings.removeModel('tts', $event)"
       >
@@ -387,6 +421,12 @@ function patchAdapter(
           v-model="videoWorkflow"
           :placeholder="settings.config.video.provider === 'apimart' ? 'grok-imagine-1.5-video-ext' : 'minimax_h3_lightx2v_v5_15s'"
         />
+        <div v-if="videoCommonModels.length" class="video-common-models" role="group" aria-label="常用视频模型">
+          <span>常用模型，点击使用</span>
+          <button v-for="name in videoCommonModels" :key="name" type="button"
+            :class="{ on: videoWorkflow === name }" :aria-pressed="videoWorkflow === name"
+            @click="videoWorkflow = name">{{ name }}</button>
+        </div>
         <label>API Key / Token</label>
         <div class="secret">
           <input
@@ -414,6 +454,11 @@ function patchAdapter(
 </template>
 
 <style scoped>
+.llm-api-settings{display:grid;gap:10px;padding:18px;border:1px solid var(--color-border);border-radius:12px;min-width:0}
+.llm-advanced{padding-top:12px;border-top:1px solid var(--color-border)}.llm-advanced summary{font-size:12px;color:var(--color-text-3);cursor:pointer}.llm-advanced[open]>summary{margin-bottom:12px}
+.llm-api-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:24px}.llm-profiles{display:grid;align-content:start;gap:10px;min-width:0}.llm-connection{display:grid;align-content:start;gap:12px;min-width:0}.llm-api-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--color-border)}.llm-profiles .name-input{box-sizing:border-box;width:100%}.llm-api-actions button{background:var(--color-accent);color:var(--color-on-accent);padding:9px 14px;border-radius:7px;font-size:12px}.llm-api-actions span{font-size:11px;color:var(--color-text-4)}.llm-api-notice,.llm-api-error{margin:0;font-size:12px;line-height:1.6}.llm-api-error{color:var(--color-error)}.llm-api-notice{color:var(--color-text-3)}
+@media(max-width:1050px){.llm-api-layout{grid-template-columns:1fr;gap:18px}}
+
 .mods {
   display: flex;
   flex-direction: column;
@@ -430,6 +475,10 @@ function patchAdapter(
   font-size: 15px;
   font-weight: 650;
 }
+.video-common-models { display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 8px; }
+.video-common-models > span { width:100%; font-size:11px; color:var(--color-text-4); }
+.video-common-models button { max-width:100%; padding:5px 9px; border:1px solid var(--color-border); border-radius:5px; background:var(--color-bg-2); color:var(--color-text-2); font-size:12px; overflow-wrap:anywhere; }
+.video-common-models button:hover, .video-common-models button.on { border-color:var(--color-accent); color:var(--color-text-1); background:var(--color-fill); }
 .api-title { margin-top: 14px !important; }
 .rule-details { margin: 10px 0 4px; padding: 10px 12px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-bg-1); }
 .rule-details summary { cursor: pointer; color: var(--color-text-2); font-size: 12px; font-weight: 600; }

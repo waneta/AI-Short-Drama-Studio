@@ -1,4 +1,5 @@
 import { comfyGenerationRecord } from './generationRecord'
+import { abortableDelay, throwIfAborted, isTimeoutAbort, controlledSignal } from './abort'
 import type { GenerationRecord } from '@/types'
 /**
  * 自定义接入适配器：OpenAI 兼容 / 自定义 HTTP / ComfyUI（AutoDL 风格 + 原生 /prompt）
@@ -273,6 +274,7 @@ export async function providerHttp(
     timeoutMs?: number
   } = {}
 ): Promise<ProxyHttpResult> {
+  throwIfAborted(init.signal)
   const method = (init.method || 'GET').toUpperCase()
   const timeoutMs = init.timeoutMs ?? 60_000
   // 桌面端统一走主进程，既绕过云端 ComfyUI 的 CORS，也让 /view 二进制输出可用。
@@ -316,10 +318,7 @@ export async function providerHttp(
     }
   }
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  const onAbort = () => controller.abort()
-  init.signal?.addEventListener('abort', onAbort)
+  const request = controlledSignal(init.signal, timeoutMs)
   try {
     const headers = { ...(init.headers || {}) }
     let body: BodyInit | undefined = init.body
@@ -339,7 +338,7 @@ export async function providerHttp(
       method,
       headers,
       body,
-      signal: controller.signal
+      signal: request.signal
     })
     const bytes = await resp.arrayBuffer()
     const text = new TextDecoder().decode(bytes)
@@ -356,9 +355,14 @@ export async function providerHttp(
       },
       blob: async () => new Blob([bytes], { type: resp.headers.get('content-type') || 'application/octet-stream' })
     }
+  } catch (error) {
+    // Keep our explicit timeout or caller cancellation instead of the browser's generic AbortError.
+    if (request.signal.aborted) {
+      throw request.signal.reason ?? new DOMException('任务已取消', 'AbortError')
+    }
+    throw error
   } finally {
-    clearTimeout(timer)
-    init.signal?.removeEventListener('abort', onAbort)
+    request.cleanup()
   }
 }
 
@@ -721,6 +725,7 @@ function buildMultipart(
  * 直接把 data URL 塞给 LoadImage 是无效的——Comfy 只认自己目录里的文件名。
  */
 async function uploadComfyMedia(opts: {
+  label: string
   baseUrl: string
   dataUrl: string
   apiKey?: string
@@ -731,7 +736,7 @@ async function uploadComfyMedia(opts: {
   const { bytes, mime } = dataUrlToBytes(opts.dataUrl)
   const name = `aicust-${Date.now().toString(36)}-${crypto.randomUUID()}.${extOfMime(mime)}`
   const { bodyBase64, contentType } = buildMultipart({ overwrite: 'true' }, { name, mime, bytes }, 'image')
-  opts.onProgress?.(mime.startsWith('audio/') ? '上传参考声音到 ComfyUI…' : '上传参考图到 ComfyUI…')
+  opts.onProgress?.(`上传${opts.label}到 ComfyUI…`)
   const res = await providerHttp(joinUrl(trimSlash(opts.baseUrl), '/upload/image'), {
     method: 'POST',
     headers: buildAuthHeader(opts.apiKey || '', {
@@ -766,6 +771,26 @@ function fillWorkflowTemplate(template: string, vars: Record<string, string>): a
 }
 
 /** 原生 ComfyUI：POST /prompt，轮询 /history/{id}，取 /view */
+/** Native ComfyUI supports prompt_id-targeted interruption (verified on local/remote deployments).
+ * Delete first so queued work cannot start later, then interrupt that same ID if it raced into execution.
+ * Never send the global interrupt body or clear the queue.
+ */
+export async function cancelComfyPrompt(base: string, promptId: string, headers: Record<string, string>) {
+  if (!promptId.trim()) throw new Error('缺少 ComfyUI 任务 ID，不能定向取消')
+  const failures: string[] = []
+  for (const [path, body] of [
+    ['/queue', { delete: [promptId] }],
+    ['/interrupt', { prompt_id: promptId }]
+  ] as const) {
+    try {
+      const result = await providerHttp(joinUrl(base, path), { method: 'POST', headers,
+        body: JSON.stringify(body), timeoutMs: 10_000 })
+      if (!result.ok) failures.push(`${path} HTTP ${result.status}`)
+    } catch (error) { failures.push(`${path}: ${error instanceof Error ? error.message : String(error)}`) }
+  }
+  if (failures.length) throw new Error(`已停止本次等待，但未能确认 ComfyUI 后台取消：${failures.join('；')}。后台可能仍在生成，请检查 ComfyUI 队列。`)
+}
+
 export async function comfyPromptGenerate(opts: {
   baseUrl: string
   apiKey?: string
@@ -794,6 +819,7 @@ export async function comfyPromptGenerate(opts: {
   generationTimeoutMs?: number
   onProgress?: (msg: string) => void
 }): Promise<{ blob: Blob; mimeType: string; generation?: Partial<GenerationRecord> }> {
+  throwIfAborted(opts.signal)
   const base = trimSlash(opts.baseUrl)
   const referenceImages = opts.imageDataUrls?.length ? opts.imageDataUrls : opts.imageDataUrl ? [opts.imageDataUrl] : []
   const referenceAudios = opts.audioDataUrls?.length ? opts.audioDataUrls : opts.audioDataUrl ? [opts.audioDataUrl] : []
@@ -881,8 +907,10 @@ export async function comfyPromptGenerate(opts: {
     const mode = b.mediaMode || 'upload'
     if (mode !== 'upload') continue
     if (b.role === 'image' ? uploadedImages[imageIndex] : b.role === 'audio' ? uploadedAudios[audioIndex] : uploaded[b.role]) continue
+    const label = b.role === 'image' ? `第${imageIndex + 1}张参考图` : b.role === 'audio' ? `第${audioIndex + 1}条参考声音` : COMFY_ROLE_LABEL[b.role]
     try {
       const name = await uploadComfyMedia({
+        label,
         baseUrl: base,
         dataUrl: src,
         apiKey: opts.apiKey,
@@ -894,9 +922,11 @@ export async function comfyPromptGenerate(opts: {
       else if (b.role === 'audio') uploadedAudios[audioIndex] = name
       else uploaded[b.role] = name
     } catch (e: any) {
-      throw new Error(
-        `[comfyui] ${COMFY_ROLE_LABEL[b.role]}上传失败：${e?.message || e}。该工作流需要先把素材传到 Comfy 的 input 目录。`
-      )
+      if (isTimeoutAbort(e, opts.signal)) {
+        throw new Error(`[comfyui] ${label}上传超时：${e?.message || '服务未及时响应'}。请检查 ComfyUI 服务和队列；若日志出现显存不足，先恢复服务后重试。本次尚未提交生成。`)
+      }
+      throwIfAborted(opts.signal)
+      throw new Error(`[comfyui] ${label}上传失败：${e?.message || e}。请检查 ComfyUI 服务和连接；本次尚未提交生成。`)
     }
   }
   const values: ComfyInjectValues = {
@@ -930,14 +960,19 @@ export async function comfyPromptGenerate(opts: {
 
   const generation = { ...comfyGenerationRecord(payload), prompt: opts.prompt }
   opts.onProgress?.('提交 ComfyUI 队列…')
+  throwIfAborted(opts.signal)
   const submitUrl = joinUrl(base, submitPath)
-  const submit = await providerHttp(submitUrl, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: opts.signal,
-    timeoutMs: 120_000
-  })
+  let submit: ProxyHttpResult
+  try {
+    submit = await providerHttp(submitUrl, {
+      method: 'POST', headers, body: JSON.stringify(payload),
+      // Receive the ID even if cancelled during submission, then cancel that exact task.
+      timeoutMs: 120_000
+    })
+  } catch (error) {
+    if (opts.signal?.aborted) throw new Error('已停止本次等待，但提交响应未返回任务 ID，无法确认 ComfyUI 后台是否仍在生成，请检查队列。')
+    throw error
+  }
   if (!submit.ok) {
     throw new Error(
       `[comfyui] 提交失败 ${submit.status} ${await submit.text()}\n若是自建 ComfyUI，请在接入里填写 adapter.workflowTemplate（完整 /prompt JSON）。`
@@ -950,119 +985,130 @@ export async function comfyPromptGenerate(opts: {
     throw new Error(`[comfyui] 提交成功但没有 prompt_id：${JSON.stringify(submitJson).slice(0, 200)}`)
   }
 
-  Object.assign(generation, { promptId })
-  opts.onProgress?.('ComfyUI 已接收任务，等待生成结果…')
-  const started = Date.now()
-  const requestedTimeout = opts.generationTimeoutMs
-  const timeoutMs = requestedTimeout && Number.isFinite(requestedTimeout)
-    ? Math.max(60_000, Math.min(120 * 60_000, requestedTimeout))
-    : opts.kind === 'video' ? 15 * 60_000 : 6 * 60_000
-  while (Date.now() - started < timeoutMs) {
-    if (opts.signal?.aborted) throw new Error('已取消')
-    await new Promise((r) => setTimeout(r, 1500))
-    const elapsed = Math.floor((Date.now() - started) / 1000)
-    const waited = elapsed >= 60 ? `${Math.floor(elapsed / 60)}分${elapsed % 60}秒` : `${elapsed}秒`
-    // An empty /history is normal while queued or executing; it must not freeze the submit label.
-    opts.onProgress?.(`等待 ComfyUI 生成结果…（已等待 ${waited}，含排队时间）`)
-    const pollUrl = joinUrl(base, pollPath.replace(/\{id\}/g, encodeURIComponent(promptId)))
-    const poll = await providerHttp(pollUrl, {
-      method: 'GET',
-      headers,
-      signal: opts.signal,
-      timeoutMs: 60_000
-    })
-    if (!poll.ok) continue
-    const hist = await poll.json()
-    const entry = hist?.[promptId] || hist?.data || hist
-    if (!entry || (typeof entry === 'object' && !entry.outputs && !entry.status)) continue
+  try {
+    throwIfAborted(opts.signal)
+    Object.assign(generation, { promptId })
+    opts.onProgress?.('ComfyUI 已接收任务，等待生成结果…')
+    const started = Date.now()
+    const requestedTimeout = opts.generationTimeoutMs
+    const timeoutMs = requestedTimeout && Number.isFinite(requestedTimeout)
+      ? Math.max(60_000, Math.min(120 * 60_000, requestedTimeout))
+      : opts.kind === 'video' ? 15 * 60_000 : 6 * 60_000
+    while (Date.now() - started < timeoutMs) {
+      await abortableDelay(1500, opts.signal)
+      const elapsed = Math.floor((Date.now() - started) / 1000)
+      const waited = elapsed >= 60 ? `${Math.floor(elapsed / 60)}分${elapsed % 60}秒` : `${elapsed}秒`
+      // An empty /history is normal while queued or executing; it must not freeze the submit label.
+      opts.onProgress?.(`等待 ComfyUI 生成结果…（已等待 ${waited}，含排队时间）`)
+      const pollUrl = joinUrl(base, pollPath.replace(/\{id\}/g, encodeURIComponent(promptId)))
+      const poll = await providerHttp(pollUrl, {
+        method: 'GET',
+        headers,
+        signal: opts.signal,
+        timeoutMs: 60_000
+      })
+      if (!poll.ok) continue
+      const hist = await poll.json()
+      const entry = hist?.[promptId] || hist?.data || hist
+      if (!entry || (typeof entry === 'object' && !entry.outputs && !entry.status)) continue
 
-    const statusStr = String(entry?.status?.status_str || entry?.status || '').toLowerCase()
-    if (/error|fail/.test(statusStr)) {
-      throw new Error(`[comfyui] 任务失败：${JSON.stringify(entry.status || entry).slice(0, 240)}`)
-    }
-
-    const outputs = entry.outputs || entry
-    const foundOutputs: Array<{ filename: string; subfolder?: string; type?: string }> = []
-    const visit = (node: any) => {
-      if (!node) return
-      if (Array.isArray(node)) {
-        node.forEach(visit)
-        return
+      const statusStr = String(entry?.status?.status_str || entry?.status || '').toLowerCase()
+      if (/error|fail/.test(statusStr)) {
+        throw new Error(`[comfyui] 任务失败：${JSON.stringify(entry.status || entry).slice(0, 240)}`)
       }
-      if (typeof node !== 'object') return
-      if (node.filename && (node.type === 'output' || !node.type || node.subfolder != null)) {
-        foundOutputs.push({
-          filename: String(node.filename),
-          subfolder: node.subfolder ? String(node.subfolder) : '',
-          type: node.type ? String(node.type) : 'output'
+
+      const outputs = entry.outputs || entry
+      const foundOutputs: Array<{ filename: string; subfolder?: string; type?: string }> = []
+      const visit = (node: any) => {
+        if (!node) return
+        if (Array.isArray(node)) {
+          node.forEach(visit)
+          return
+        }
+        if (typeof node !== 'object') return
+        if (node.filename && (node.type === 'output' || !node.type || node.subfolder != null)) {
+          foundOutputs.push({
+            filename: String(node.filename),
+            subfolder: node.subfolder ? String(node.subfolder) : '',
+            type: node.type ? String(node.type) : 'output'
+          })
+          return
+        }
+        for (const v of Object.values(node)) visit(v)
+      }
+      visit(outputs)
+      const mediaKind = (name: string) => /\.(mp4|webm|mov|m4v|mkv|avi)(?:$|[?#])/i.test(name)
+        ? 'video' : /\.(png|jpe?g|webp|gif|bmp)(?:$|[?#])/i.test(name) ? 'image' : 'unknown'
+      const wanted = opts.kind || 'image'
+      const fileMeta = foundOutputs.find((item) => mediaKind(item.filename) === wanted)
+        || foundOutputs.find((item) => mediaKind(item.filename) === 'unknown') || null
+      if (!fileMeta && foundOutputs.length) {
+        throw new Error(`[comfyui] 工作流没有输出 ${wanted === 'video' ? '视频' : '图片'} 文件，请检查保存节点`)
+      }
+
+      const direct =
+        (adapter.resultJsonPath ? getByJsonPath(entry, adapter.resultJsonPath) : null) ||
+        (!fileMeta ? findFirstMediaUrl(outputs) : null)
+      if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) {
+        opts.onProgress?.('下载 ComfyUI 输出…')
+        const r = await providerHttp(direct, {
+          method: 'GET',
+          headers: buildAuthHeader(opts.apiKey || '', adapter),
+          signal: opts.signal,
+          timeoutMs: 180_000
         })
-        return
+        if (!r.ok) throw new Error(`[comfyui] 下载失败 ${r.status}`)
+        const blob = await r.blob()
+        throwIfAborted(opts.signal)
+        return {
+          blob,
+          generation,
+          mimeType: blob.type || (opts.kind === 'video' ? 'video/mp4' : 'image/png')
+        }
       }
-      for (const v of Object.values(node)) visit(v)
-    }
-    visit(outputs)
-    const mediaKind = (name: string) => /\.(mp4|webm|mov|m4v|mkv|avi)(?:$|[?#])/i.test(name)
-      ? 'video' : /\.(png|jpe?g|webp|gif|bmp)(?:$|[?#])/i.test(name) ? 'image' : 'unknown'
-    const wanted = opts.kind || 'image'
-    const fileMeta = foundOutputs.find((item) => mediaKind(item.filename) === wanted)
-      || foundOutputs.find((item) => mediaKind(item.filename) === 'unknown') || null
-    if (!fileMeta && foundOutputs.length) {
-      throw new Error(`[comfyui] 工作流没有输出 ${wanted === 'video' ? '视频' : '图片'} 文件，请检查保存节点`)
-    }
 
-    const direct =
-      (adapter.resultJsonPath ? getByJsonPath(entry, adapter.resultJsonPath) : null) ||
-      (!fileMeta ? findFirstMediaUrl(outputs) : null)
-    if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) {
-      opts.onProgress?.('下载 ComfyUI 输出…')
-      const r = await providerHttp(direct, {
-        method: 'GET',
-        headers: buildAuthHeader(opts.apiKey || '', adapter),
-        signal: opts.signal,
-        timeoutMs: 180_000
-      })
-      if (!r.ok) throw new Error(`[comfyui] 下载失败 ${r.status}`)
-      const blob = await r.blob()
-      return {
-        blob,
-        generation,
-        mimeType: blob.type || (opts.kind === 'video' ? 'video/mp4' : 'image/png')
+      if (fileMeta) {
+        const q = new URLSearchParams({
+          filename: fileMeta.filename,
+          subfolder: fileMeta.subfolder || '',
+          type: fileMeta.type || 'output'
+        })
+        const viewUrl = `${base}/view?${q.toString()}`
+        opts.onProgress?.('下载 ComfyUI 输出…')
+        const view = await providerHttp(viewUrl, {
+          method: 'GET',
+          headers: buildAuthHeader(opts.apiKey || '', adapter),
+          signal: opts.signal,
+          timeoutMs: 180_000
+        })
+        if (!view.ok) {
+          throw new Error(`[comfyui] /view 失败 ${view.status}`)
+        }
+        const blob = await view.blob()
+        throwIfAborted(opts.signal)
+        const name = fileMeta.filename.toLowerCase()
+        const mime =
+          blob.type ||
+          (name.endsWith('.mp4')
+            ? 'video/mp4'
+            : name.endsWith('.webm')
+              ? 'video/webm'
+              : name.endsWith('.jpg') || name.endsWith('.jpeg')
+                ? 'image/jpeg'
+                : 'image/png')
+        return { blob, mimeType: mime, generation }
       }
+      opts.onProgress?.('ComfyUI 生成中…')
     }
-
-    if (fileMeta) {
-      const q = new URLSearchParams({
-        filename: fileMeta.filename,
-        subfolder: fileMeta.subfolder || '',
-        type: fileMeta.type || 'output'
-      })
-      const viewUrl = `${base}/view?${q.toString()}`
-      opts.onProgress?.('下载 ComfyUI 输出…')
-      const view = await providerHttp(viewUrl, {
-        method: 'GET',
-        headers: buildAuthHeader(opts.apiKey || '', adapter),
-        signal: opts.signal,
-        timeoutMs: 180_000
-      })
-      if (!view.ok) {
-        throw new Error(`[comfyui] /view 失败 ${view.status}`)
-      }
-      const blob = await view.blob()
-      const name = fileMeta.filename.toLowerCase()
-      const mime =
-        blob.type ||
-        (name.endsWith('.mp4')
-          ? 'video/mp4'
-          : name.endsWith('.webm')
-            ? 'video/webm'
-            : name.endsWith('.jpg') || name.endsWith('.jpeg')
-              ? 'image/jpeg'
-              : 'image/png')
-      return { blob, mimeType: mime, generation }
+    throw new Error('[comfyui] 等待结果超时')
+  } catch (error) {
+    if (opts.signal?.aborted && !isTimeoutAbort(error, opts.signal)) {
+      opts.onProgress?.('正在取消 ComfyUI 本次任务…')
+      await cancelComfyPrompt(base, promptId, headers)
+      throw new DOMException('已取消本次生成，可修改参数后重新生成', 'AbortError')
     }
-    opts.onProgress?.('ComfyUI 生成中…')
+    throw error
   }
-  throw new Error('[comfyui] 等待结果超时')
 }
 
 export interface ConnectionTestResult {

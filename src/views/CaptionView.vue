@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import TtsSourceAudioSelect from '@/components/common/TtsSourceAudioSelect.vue'
+import RecoverShotVideos from '@/components/common/RecoverShotVideos.vue'
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore, useToastStore, useAssetsStore, useSettingsStore } from '@/stores'
@@ -66,7 +68,7 @@ const highlightScale = computed({
 })
 const ttsVoices = computed(() => voicesForModel(settings.config.tts.model))
 const ttsVoice = computed({
-  get: () => compatibleVoice(settings.config.tts.model, project.current?.settings.ttsVoice || settings.config.tts.voice),
+  get: () => compatibleVoice(settings.config.tts.model, project.current?.settings.ttsVoice || settings.config.tts.voice, settings.config.tts.voice),
   set: (v: string) => project.setSettings({ ttsVoice: v })
 })
 
@@ -166,7 +168,7 @@ function changeAudioMode(shot: Shot, mode: ShotAudioMode) {
   if (effectiveShotAudioMode(shot) === mode) return
   const hadVideo = Boolean(shot.videoAssetId)
   project.setShotAudioMode(shot.id, mode)
-  if (hadVideo) toast.info(`第 ${shot.index + 1} 镜人声方案已改变，请重新生成视频以匹配声音和口型。`, 6000)
+  if (hadVideo) toast.info(mode === 'tts' ? '已保留视频和配音，导出原声按本镜“TTS原声”选项处理。' : '已保留视频；新的人声生成要求在下次生成视频时生效。', 6000)
 }
 
 function isStale(shot: Shot | undefined) {
@@ -193,27 +195,29 @@ async function saveVoiceover(shot: Shot, blob: Blob, mimeType: string, text: str
 async function generateLine(shotId: string) {
   if (isDigitalHuman.value) {
     toast.info('数字人口播视频已经带上传音频，不需要再配音')
-    return
+    return false
   }
   const shot = shots.value.find((s) => s.id === shotId)
-  if (!shot) return
+  if (!shot) return false
   const text = shot.voiceover.trim()
   if (!text) {
     toast.warn(`第 ${shot.index + 1} 段没有台词`)
-    return
+    return false
   }
   if (effectiveShotAudioMode(shot) !== 'tts') {
     const hadVideo = Boolean(shot.videoAssetId)
     project.setShotAudioMode(shot.id, 'tts')
-    if (hadVideo) toast.info(`第 ${shot.index + 1} 镜已改为后期 TTS；请重新生成视频，使 H3 保持闭嘴。`, 6000)
+    if (hadVideo && !generatingAll.value) toast.info('已保留视频和配音，导出原声按本镜“TTS原声”选项处理。', 6000)
   }
   generating.value.add(shotId)
   try {
     const result = await generateSpeech({ text, voice: ttsVoice.value })
     await saveVoiceover(shot, result.blob, result.mimeType, text)
     toast.success(`第 ${shot.index + 1} 段配音完成`)
+    return true
   } catch (e: any) {
     toast.error(`第 ${shot.index + 1} 段配音失败：${e.message}`, 8000)
+    return false
   } finally {
     generating.value.delete(shotId)
   }
@@ -230,16 +234,17 @@ async function generateAllVoices() {
     return
   }
   generatingAll.value = true
-  let ok = 0
+  let ok = 0, failed = 0
   try {
     const seen = new Set<string>()
     for (const line of todo) {
       if (seen.has(line.shotId)) continue
       seen.add(line.shotId)
-      await generateLine(line.shotId)
-      if (shots.value.find((s) => s.id === line.shotId)?.audioAssetId) ok++
+      if (await generateLine(line.shotId)) ok++
+      else failed++
     }
-    toast.success(`已为 ${ok} 段台词生成人声`)
+    if (failed) toast.warn(`本次配音成功 ${ok} 段，失败 ${failed} 段；已有视频已保留。`)
+    else toast.success(`已为 ${ok} 段台词生成人声，视频画面已保留。`)
   } finally {
     generatingAll.value = false
   }
@@ -398,6 +403,7 @@ function next() {
         <GradientButton icon="→" @click="next">下一步：导出</GradientButton>
       </div>
     </header>
+    <RecoverShotVideos :disabled="generatingAll || generating.size > 0" />
 
     <div class="layout">
       <main class="left">
@@ -466,6 +472,7 @@ function next() {
                 <select
                   class="input"
                   :value="line.shot ? effectiveShotAudioMode(line.shot) : 'none'"
+                  :disabled="generatingAll || generating.has(line.shotId)"
                   @change="line.shot && changeAudioMode(line.shot, ($event.target as HTMLSelectElement).value as ShotAudioMode)"
                 >
                   <option value="h3-dialogue">H3 出镜对白 + 对口型</option>
@@ -474,6 +481,7 @@ function next() {
                   <option value="none">无口播</option>
                 </select>
               </label>
+              <TtsSourceAudioSelect v-if="line.shot && !isDigitalHuman" :shot-id="line.shotId" :disabled="generating.has(line.shotId) || generatingAll" />
               <audio v-if="audioUrls[line.shotId]" class="vo-player" :src="audioUrls[line.shotId]" controls />
               <div class="line-actions">
                 <GradientButton

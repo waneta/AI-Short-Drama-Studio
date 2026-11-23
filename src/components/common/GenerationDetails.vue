@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { useAssetsStore, useLibraryStore } from '@/stores'
-const props = withDefaults(defineProps<{ assetId?: string; label?: string }>(), { label: '本次结果参数' })
+const props = withDefaults(defineProps<{ assetId?: string; label?: string; draggableHeader?: boolean }>(), { label: '本次结果参数' })
+const router = useRouter(), route = useRoute()
 const assets = useAssetsStore()
 const library = useLibraryStore()
 const asset = computed(() => props.assetId ? assets.getMeta(props.assetId) || library.getMeta(props.assetId) : undefined)
@@ -24,41 +26,53 @@ const rows = computed(() => {
   const r = record.value
   if (!r || !known.value) return []
   return [
-    ['模型', r.model], ['模型接入', r.profileName], ['分辨率档位', r.resolution],
+    ['模型', r.model], ['模型接入', r.profileName], ['分辨率档位', r.resolution], ['画质', r.quality],
     ['请求宽高', r.requestedWidth && r.requestedHeight ? `${r.requestedWidth}×${r.requestedHeight}` : undefined],
     ['生成画布', r.generationWidth && r.generationHeight ? `${r.generationWidth}×${r.generationHeight}` : undefined],
     ['画幅', r.aspectRatio], ['风格', r.style], ['种子', r.seed], ['采样步数', r.steps], ['CFG', r.cfg],
     ['生成帧率', r.fps], ['采样器', r.sampler], ['调度器', r.scheduler], ['去噪', r.denoise], ['请求时长', r.duration != null ? `${r.duration}秒` : undefined],
-    ['生成模式', r.mode], ['请求音轨', r.audioEnabled == null ? undefined : r.audioEnabled ? '开启' : '关闭'],
+    ['生成模式', ({ text: '文生视频', 'audio-sync': '数字人口播', omni: '全能参考', image: '图生视频', 'first-last': '首尾帧', reference: '图片参考', fl2va: '首尾帧' } as Record<string, string>)[r.mode || ''] || r.mode], ['请求音轨', r.audioEnabled == null ? undefined : r.audioEnabled ? '开启' : '关闭'],
     ['参考声音', r.referenceAudios?.map(item => item.filename || item.assetId).join('、') || r.referenceAudio?.filename || r.referenceAudio?.assetId], ['参考图数', r.referenceCount], ['权重', r.checkpoints?.join('、')], ['任务编号', r.promptId],
     ['生成时间', new Date(r.createdAt).toLocaleString()]
   ].filter(([, value]) => value !== undefined && value !== '')
 })
+// Let Vue Flow handle drags from the result header; expanded values remain selectable.
+function onPointerStart(event: Event) {
+  if (!props.draggableHeader) event.stopPropagation()
+}
 </script>
 
 <template>
-  <details v-if="assetId" class="generation-details nodrag nowheel" @pointerdown.stop @mousedown.stop @click.stop @wheel.stop>
+  <details v-if="assetId" class="generation-details nowheel nokey" :class="{ nodrag: !draggableHeader, 'draggable-header': draggableHeader }" @pointerdown="onPointerStart" @mousedown="onPointerStart" @click.stop @wheel.stop>
     <summary>{{ label }}<span v-if="known"> · {{ record?.model }} · {{ size }}</span><span v-else> · {{ size || '旧素材' }} · 参数未记录</span><span v-if="elapsed"> · 耗时 {{ elapsed }}</span></summary>
-    <p class="generation-note">这里显示当前素材生成时的记录；修改下方或其他节点的设置，不会改写这份记录。</p>
-    <dl>
-      <template v-if="size"><dt>实际输出</dt><dd>{{ size }}</dd></template>
-      <template v-if="asset && 'duration' in asset"><dt>实际时长</dt><dd>{{ asset.duration.toFixed(2) }}秒</dd></template>
-      <template v-if="asset?.kind === 'video'"><dt>实际音轨</dt><dd>{{ asset.hasAudio ? '有' : '无' }}</dd></template>
-      <template v-for="[label, value] in rows" :key="String(label)"><dt>{{ label }}</dt><dd>{{ value }}</dd></template>
-    </dl>
-    <p v-if="!known" class="generation-note">这份素材没有保存原始生成参数，无法可靠还原当时的模型、种子和设置。重新生成后会自动记录。</p>
-    <template v-else>
-      <details v-if="record?.samplers?.length"><summary>各采样阶段</summary><pre>{{ JSON.stringify(record.samplers, null, 2) }}</pre></details>
-      <label>提交提示词</label><pre>{{ record?.prompt }}</pre>
-      <template v-if="record?.userPrompt && record.userPrompt !== record.prompt"><label>输入提示词</label><pre>{{ record.userPrompt }}</pre></template>
-    </template>
-    <dl class="generation-elapsed"><dt>耗时</dt><dd title="从开始提交到结果取回，包含上传、排队、生成和下载。">{{ elapsed || '未记录' }}</dd></dl>
+    <div class="generation-details-body nodrag" @pointerdown.stop @mousedown.stop>
+      <button v-if="record" type="button" class="compare-link" @click="router.push({ name: 'generation-stats', query: { asset: assetId, kind: asset?.kind, returnTo: route.name === 'studio' ? 'studio' : 'home' } })">比较同条件记录 ↗</button>
+      <p class="generation-note">这里显示当前素材生成时的记录；修改下方或其他节点的设置，不会改写这份记录。</p>
+      <dl>
+        <template v-if="size"><dt>实际输出</dt><dd>{{ size }}</dd></template>
+        <template v-if="asset && 'duration' in asset"><dt>实际时长</dt><dd>{{ asset.duration.toFixed(2) }}秒</dd></template>
+        <template v-if="asset?.kind === 'video'"><dt>实际音轨</dt><dd>{{ asset.hasAudio ? '有' : '无' }}</dd></template>
+        <template v-for="[label, value] in rows" :key="String(label)"><dt>{{ label }}</dt><dd>{{ value }}</dd></template>
+      </dl>
+      <p v-if="!known" class="generation-note">这份素材没有保存原始生成参数，无法可靠还原当时的模型、种子和设置。重新生成后会自动记录。</p>
+      <template v-else>
+        <details v-if="record?.samplers?.length"><summary>各采样阶段</summary><pre>{{ JSON.stringify(record.samplers, null, 2) }}</pre></details>
+        <label>提交提示词</label><pre>{{ record?.prompt }}</pre>
+        <template v-if="record?.userPrompt && record.userPrompt !== record.prompt"><label>输入提示词</label><pre>{{ record.userPrompt }}</pre></template>
+      </template>
+      <dl class="generation-elapsed"><dt>耗时</dt><dd title="从开始提交到结果取回，包含上传、排队、生成和下载。">{{ elapsed || '未记录' }}</dd></dl>
+    </div>
   </details>
 </template>
 
 <style scoped>
 .generation-details { box-sizing: border-box; flex: 1 0 100%; max-width: 100%; padding: 7px 9px; color: var(--color-text-2); border-top: 1px solid var(--color-border); font-size: 10px; line-height: 1.5; }
+.compare-link { border:1px solid var(--color-border); border-radius:6px; padding:4px 8px; background:var(--color-bg-3); color:var(--color-text-1); font:inherit; cursor:pointer; margin-top:6px; }
 summary { cursor: pointer; overflow-wrap: anywhere; }
+.generation-details.draggable-header { cursor: grab; }
+.draggable-header > summary { cursor: grab; user-select: none; }
+.draggable-header > summary:active { cursor: grabbing; }
+.generation-details-body { cursor: auto; }
 summary span { color: var(--color-text-3); }
 dl { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 4px 8px; margin: 6px 0; }
 dt { color: var(--color-text-3); } dd { margin: 0; overflow-wrap: anywhere; user-select: text; }

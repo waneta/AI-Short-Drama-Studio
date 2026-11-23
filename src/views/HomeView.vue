@@ -373,14 +373,11 @@ async function moveSelectedLibrary() {
       <div class="hero-glow" />
       <div class="hero-content">
         <span class="hero-badge"><i class="dot" />剧流 Studio · AI 短剧工作台</span>
-        <h1 class="title">
-          一句话，<span class="gradient-text">一条 AI 流水线</span>，<br />
-          输出一条视频
-        </h1>
-        <p class="subtitle">
-          无限画布 + 智能体：人设、分镜、配图、视频都在一张图上连起来。{{ isDesktop() ? '资源存在本地文件夹。' : 'Web 版项目与素材保存在当前浏览器，请及时下载备份。' }}
-        </p>
         <div class="hero-actions">
+          <GradientButton size="lg" type="ghost" @click="router.push('/generation-stats')">
+            <template #icon><HomeIcon name="history" :size="18" /></template>
+            生成统计
+          </GradientButton>
           <GradientButton size="lg" type="secondary" @click="openQuickEditor">
             <template #icon><HomeIcon name="scissors" :size="18" /></template>
             视频剪辑
@@ -475,7 +472,7 @@ async function moveSelectedLibrary() {
       <EmptyState
         v-if="filteredProjects.length === 0"
         title="还没有项目"
-        description="点击「新建」直接开一张画布，告诉左侧智能体想做什么就行"
+        description="点击「新建」直接开一张画布，点击底部 AI 助手，告诉它想做什么就行"
       >
         <template #icon><HomeIcon name="film" :size="44" /></template>
         <template #action>
@@ -678,8 +675,8 @@ async function moveSelectedLibrary() {
                 <span>♫ 声音 · {{ fmtDuration(a.duration) }}</span>
                 <audio v-if="libUrls[a.id]" :src="libUrls[a.id]" controls preload="metadata" :aria-label="`试听 ${a.filename}`" />
               </div>
-              <button v-else type="button" class="lib-thumb" @click="libUrls[a.id] && openLightbox(libUrls[a.id], 'image')">
-                <img v-if="libUrls[a.id]" :src="libUrls[a.id]" alt="" />
+              <button v-else type="button" class="lib-thumb" @click="libUrls[a.id] && openLightbox(libUrls[a.id], a.kind === 'video' ? 'video' : 'image')">
+                <video v-if="libUrls[a.id] && a.kind === 'video'" :src="libUrls[a.id]" muted playsinline preload="metadata" /><img v-else-if="libUrls[a.id]" :src="libUrls[a.id]" alt="" />
                 <span v-else><HomeIcon name="image" :size="30" /></span>
               </button>
               <div class="lib-meta">
@@ -763,21 +760,6 @@ async function moveSelectedLibrary() {
 @keyframes badge-pulse {
   0%, 100% { opacity: 0.55; }
   50% { opacity: 1; }
-}
-.title {
-  max-width: 780px;
-  font-size: clamp(38px, 4.4vw, 58px);
-  font-weight: 700;
-  line-height: 1.1;
-  margin: 0 0 18px;
-  letter-spacing: -0.035em;
-}
-.subtitle {
-  max-width: 640px;
-  font-size: 14px;
-  color: var(--color-text-3);
-  margin: 0 0 28px;
-  line-height: 1.75;
 }
 .hero-actions {
   display: flex;
@@ -1687,7 +1669,7 @@ async function moveSelectedLibrary() {
   background: #171921;
   cursor: pointer;
 }
-.lib-thumb img {
+.lib-thumb img, .lib-thumb video {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -1727,7 +1709,6 @@ async function moveSelectedLibrary() {
     width: min(calc(100% - 28px), 1180px);
     padding-top: 36px;
   }
-  .title { font-size: 34px; }
   .stats { width: 100%; }
   .stat { min-width: 0; flex: 1; padding-inline: 10px; }
   .section-header { align-items: stretch; gap: 12px; flex-direction: column; }

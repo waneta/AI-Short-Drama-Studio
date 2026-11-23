@@ -145,7 +145,7 @@ export const IMAGE_PROVIDERS: ProviderPreset[] = [
     name: '字节跳动 火山方舟',
     hint: 'Seedream 官方生图。',
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
-    models: ['doubao-seedream-4-0-250828', 'doubao-seedream-3-0-t2i-250415'],
+    models: ['doubao-seedream-5.0-flash', 'doubao-seedream-5.0-pro', 'doubao-seedream-4-0-250828', 'doubao-seedream-3-0-t2i-250415'],
     defaultModel: 'doubao-seedream-4-0-250828'
   },
   {
@@ -153,7 +153,17 @@ export const IMAGE_PROVIDERS: ProviderPreset[] = [
     name: 'OpenAI',
     hint: '官方 Images API。',
     baseUrl: 'https://api.openai.com/v1',
-    models: ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini', 'chatgpt-image-latest'],
+    models: [
+      'gpt-image-2.6-flare',
+      'gpt-image-2.6-sunburst',
+      'gpt-image-2.5-flare',
+      'gpt-image-2.5-sunburst',
+      'gpt-image-2',
+      'gpt-image-1.5',
+      'gpt-image-1',
+      'gpt-image-1-mini',
+      'chatgpt-image-latest'
+    ],
     defaultModel: 'gpt-image-1'
   },
   {
@@ -202,6 +212,15 @@ export const IMAGE_PROVIDERS: ProviderPreset[] = [
 
 export const TTS_PROVIDERS: ProviderPreset[] = [
   {
+    id: 'volcengine-agent-plan',
+    name: '火山方舟 Agent Plan（订阅）',
+    hint: '豆包语音合成2.0，使用Agent Plan专属Key和订阅地址，消耗套餐额度。',
+    baseUrl: 'https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional',
+    models: ['seed-tts-2.0'],
+    defaultModel: 'seed-tts-2.0',
+    keyPlaceholder: 'Agent Plan 专属 API Key（ark-…）'
+  },
+  {
     id: 'dashscope-token-plan',
     name: '阿里云百炼 Token Plan（订阅）',
     hint: '使用 Token Plan 套餐专属 Key；不同于普通百炼按量计费接入。',
@@ -238,7 +257,7 @@ export const VIDEO_PROVIDERS: ProviderPreset[] = [
     name: '阿里云百炼 Token Plan（订阅）',
     hint: '使用 Token Plan 套餐专属 Key；不同于普通百炼按量计费接入。',
     baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1',
-    models: ['wan3.0-video', 'happyhorse-1.1-i2v', 'happyhorse-1.1-t2v', 'happyhorse-1.1-r2v'],
+    models: ['wan3.0-video', 'happyhorse-1.1-r2v', 'happyhorse-1.1-t2v', 'happyhorse-1.1-i2v'],
     defaultModel: 'wan3.0-video'
   },
   {

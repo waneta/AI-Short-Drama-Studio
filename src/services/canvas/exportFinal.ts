@@ -5,7 +5,7 @@
 import { exportVideo, parseSRT, buildCuesFromClips, probeMedia, trimTimelineBySpeech } from '@/services/ffmpeg'
 import { useAssetsStore, useProjectStore } from '@/stores'
 import { canBuildExport, ensureTimelineFromShots, timelineClipAssetId } from '@/utils/timeline'
-import { effectiveShotAudioMode, isDigitalHumanSpeechProject, needsExternalTts } from '@/utils/shot'
+import { keepShotSourceAudio, isDigitalHumanSpeechProject, needsExternalTts } from '@/utils/shot'
 
 export async function generateFinalCut(onProgress?: (msg: string) => void) {
   const project = useProjectStore()
@@ -112,13 +112,9 @@ export async function generateFinalCut(onProgress?: (msg: string) => void) {
     if (voiceoverAudioMap.has(clip.shotId)) continue
     const shot = p.shots.find((s) => s.id === clip.shotId)
     if (!shot) continue
-    const audioMode = effectiveShotAudioMode(shot)
     sourceAudioMap.set(
       clip.shotId,
-      isSpeech ||
-        audioMode === 'h3-dialogue' ||
-        audioMode === 'h3-voiceover' ||
-        p.settings.keepAmbientAudio !== false
+      keepShotSourceAudio(shot, p, p.settings.keepAmbientAudio !== false)
     )
     if (digitalHuman || !needsExternalTts(shot, p) || !shot.audioAssetId) continue
     const blob = await assets.getBlob(shot.audioAssetId)

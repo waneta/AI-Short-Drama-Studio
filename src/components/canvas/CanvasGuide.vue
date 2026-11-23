@@ -3,23 +3,23 @@ import { computed, ref } from 'vue'
 
 const props = withDefaults(
   defineProps<{
-    agentOpen?: boolean
-    agentWidth?: number
+    sidebarWidth?: number
     rightWidth?: number
   }>(),
-  { agentOpen: true, agentWidth: 440, rightWidth: 0 }
+  { sidebarWidth: 300, rightWidth: 0 }
 )
 
 const emit = defineEmits<{ (e: 'done'): void }>()
 
-type GuideArea = 'agent' | 'canvas' | null
+type GuideArea = 'sidebar' | 'canvas' | null
 
 const steps = [
   {
-    area: 'agent' as GuideArea,
-    title: '左边：一句话让 AI 开工',
-    sub: '把这里当成会干活的搭档，不是问答机器人',
+    area: null as GuideArea,
+    title: '右下角：打开 AI 助手',
+    sub: '点击画布右下角 AI 图标，展开右下角浮动对话框',
     items: [
+      '对话框可以随时收起，输入草稿和正在执行的任务都会保留。',
       '用大白话说就行：「写一个修仙渡劫短剧，拆 8 个分镜」，它会自己排出步骤再动手。',
       '写 / 改 / 续写剧本，提炼角色、场景、分镜，出人设图、关键帧和分镜视频都能在这儿说。',
       '它有记忆：说「记住我偏好电影感暗调」，之后每次创作都会自动带上。',
@@ -28,22 +28,24 @@ const steps = [
   },
   {
     area: 'canvas' as GuideArea,
-    title: '右边：画布是你手动操作的地方',
+    title: '中间：在画布上手动创作',
     sub: '想精确控制的时候，直接在这儿加东西',
     items: [
-      '空白处右键：添加剧本、角色、场景、分镜、图片或视频节点。',
+      '点击底部 ＋ 或空白处右键，添加剧本、角色、场景、分镜、图片或视频节点。',
       '每个节点可以单独生成，也能重跑失败的那一个，不用整个项目重来。',
       '选中节点后右侧能改提示词、时长、模型；拖动可以排布节点。',
       '节点之间的连线是「参考关系」：上游的图会给下游当参考。'
     ]
   },
   {
-    area: null as GuideArea,
-    title: '两个提示',
-    sub: '怎么用都行，不用二选一',
+    area: 'sidebar' as GuideArea,
+    title: '左侧：节点与资源',
+    sub: '快速查找项目内容',
     items: [
-      '左右两边可以随时混用：先让 AI 打底，再手动改细节，反过来也成立。',
-      '顶栏可以切到「经典步骤」，按 文案 → 剧本 → 素材 → 视频 的顺序分步做。'
+      '「画布」按组展示节点，支持搜索，点击条目定位到画布。',
+      '「资产」展示当前项目图片、视频和声音，可以筛选类型并点击预览。',
+      '底部中间操作栏最左侧的面板按钮，可以展开或收起左栏，为画布留出空间。',
+      '画布右上角「更多工作区操作」可以切到「经典步骤」，按 文案 → 剧本 → 素材 → 视频 的顺序分步做。'
     ]
   }
 ]
@@ -54,13 +56,11 @@ const step = computed(() => steps[index.value])
 const highlight = computed(() => {
   const area = step.value.area
   if (!area) return null
-  const left = area === 'agent' ? 0 : props.agentOpen ? props.agentWidth : 0
-  const right = area === 'agent' ? 'auto' : props.rightWidth
-  if (area === 'agent') {
-    if (!props.agentOpen) return null
-    return { left: '0px', right: 'auto', width: `${props.agentWidth}px` }
+  if (area === 'sidebar') {
+    if (!props.sidebarWidth) return null
+    return { left: '0px', right: 'auto', width: `${props.sidebarWidth}px` }
   }
-  return { left: `${left}px`, right: `${right}px`, width: 'auto' }
+  return { left: `${props.sidebarWidth}px`, right: `${props.rightWidth}px`, width: 'auto' }
 })
 
 function next() {
@@ -113,8 +113,9 @@ function finish() {
       <div class="foot">
         <span class="count">{{ index + 1 }} / {{ steps.length }}</span>
         <div class="btns">
-          <button type="button" class="ghost" @click="prev">上一步</button>
-          <button type="button" class="primary" @click="next">开始使用</button>
+          <button v-if="index > 0" type="button" class="ghost" @click="prev">上一步</button>
+          <button type="button" class="ghost" @click="finish">跳过</button>
+          <button type="button" class="primary" @click="next">{{ index === steps.length - 1 ? '开始使用' : '下一步' }}</button>
         </div>
       </div>
     </div>
@@ -231,6 +232,7 @@ li::before {
 }
 .foot {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -238,15 +240,20 @@ li::before {
   border-top: 1px solid var(--color-border);
 }
 .count {
+  white-space: nowrap;
   font-size: 11px;
   color: var(--color-text-4);
   font-variant-numeric: tabular-nums;
 }
 .btns {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
 }
 .btns button {
+  flex-shrink: 0;
+  white-space: nowrap;
   margin: 0;
   padding: 7px 14px;
   border-radius: 9px;

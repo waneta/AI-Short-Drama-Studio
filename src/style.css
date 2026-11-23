@@ -13,7 +13,10 @@
   --color-bg-3: #2c2c34;
   --color-bg-card: #1c1c22;
   --color-canvas: #0e0e10;
-  --color-canvas-group: #16161a;
+  --color-canvas-group: rgba(130, 145, 170, 0.035);
+  --color-node-editor: #272a33;
+  --color-node-editor-border: rgba(148, 181, 232, 0.45);
+  --shadow-node-editor: 0 0 0 1px rgba(126, 180, 255, 0.08), 0 18px 42px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.35);
   --color-node-well: #2a2a32;
   --color-node-border: rgba(255, 255, 255, 0.12);
   --shadow-node: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 28px rgba(0, 0, 0, 0.35);

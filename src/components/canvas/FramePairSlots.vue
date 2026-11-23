@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { stopNodeDragFromControls } from '@/utils/nodeDrag'
 import { computed, ref, watch } from 'vue'
 import { useAssetsStore, useLibraryStore } from '@/stores'
 import { openLightbox } from '@/composables/useLightbox'
@@ -9,7 +10,15 @@ const props = defineProps<{
   firstId?: ID
   lastId?: ID
   firstHint?: string
+  single?: boolean
+  disabled?: boolean
+  compact?: boolean
+  draggableBackground?: boolean
 }>()
+
+function onPointerStart(event: Event) {
+  stopNodeDragFromControls(event, !props.draggableBackground)
+}
 
 const emit = defineEmits<{
   'update:firstId': [id: ID | undefined]
@@ -36,10 +45,12 @@ watch(
 )
 
 function openPick(which: 'first' | 'last') {
+  if (props.disabled) return
   picking.value = which
 }
 
 function onConfirm(selected: ID[]) {
+  if (props.disabled) { picking.value = ''; return }
   const id = selected[0]
   if (picking.value === 'first') emit('update:firstId', id)
   if (picking.value === 'last') emit('update:lastId', id)
@@ -47,34 +58,35 @@ function onConfirm(selected: ID[]) {
 }
 
 function clear(which: 'first' | 'last') {
+  if (props.disabled) return
   if (which === 'first') emit('update:firstId', undefined)
   else emit('update:lastId', undefined)
 }
 </script>
 
 <template>
-  <div class="frames nodrag nowheel">
+  <div class="frames nowheel" :class="{ compact, single, nodrag: !draggableBackground }" @pointerdown="onPointerStart" @mousedown="onPointerStart">
     <div class="slot">
       <span>首帧</span>
       <button v-if="firstId && urls[firstId]" type="button" class="thumb" @click="openLightbox(urls[firstId], 'image')">
         <img :src="urls[firstId]" alt="" />
       </button>
-      <button v-else type="button" class="empty" @click="openPick('first')">＋</button>
+      <button v-else type="button" class="empty" :disabled="disabled" @click="openPick('first')">＋</button>
       <div class="row">
-        <button type="button" class="link" @click="openPick('first')">{{ firstId ? '更换' : '选择' }}</button>
-        <button v-if="firstId" type="button" class="link" @click="clear('first')">清除</button>
+        <button type="button" class="link" :disabled="disabled" @click="openPick('first')">{{ firstId ? '更换' : '选择' }}</button>
+        <button v-if="firstId" type="button" class="link" :disabled="disabled" @click="clear('first')">清除</button>
       </div>
       <small v-if="firstHint">{{ firstHint }}</small>
     </div>
-    <div class="slot">
+    <div v-if="!single" class="slot">
       <span>尾帧</span>
       <button v-if="lastId && urls[lastId]" type="button" class="thumb" @click="openLightbox(urls[lastId], 'image')">
         <img :src="urls[lastId]" alt="" />
       </button>
-      <button v-else type="button" class="empty" @click="openPick('last')">＋</button>
+      <button v-else type="button" class="empty" :disabled="disabled" @click="openPick('last')">＋</button>
       <div class="row">
-        <button type="button" class="link" @click="openPick('last')">{{ lastId ? '更换' : '选择' }}</button>
-        <button v-if="lastId" type="button" class="link" @click="clear('last')">清除</button>
+        <button type="button" class="link" :disabled="disabled" @click="openPick('last')">{{ lastId ? '更换' : '选择' }}</button>
+        <button v-if="lastId" type="button" class="link" :disabled="disabled" @click="clear('last')">清除</button>
       </div>
     </div>
     <AssetPicker
@@ -147,4 +159,9 @@ function clear(which: 'first' | 'last') {
 .link:hover {
   color: var(--color-text-1);
 }
+.frames.compact { display:flex; gap:12px; margin:2px 0; }
+.compact .slot { width:108px; }
+.compact .thumb,.compact .empty { height:62px; aspect-ratio:auto; }
+.frames.single { grid-template-columns:1fr; }
+button:disabled { opacity:.4; cursor:default; }
 </style>

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 
-const props = defineProps<{ label: string; summary: string; disabled?: boolean }>()
+const props = withDefaults(defineProps<{ label: string; summary: string; disabled?: boolean; icon?: string }>(), { icon: '▭' })
 const open = ref(false)
 const trigger = ref<HTMLButtonElement>()
 const panel = ref<HTMLDivElement>()
 const id = useId()
+let resizeObserver: ResizeObserver | undefined
 const position = ref({ left: '0px', top: '0px', maxHeight: '80vh' })
 function place() {
   const rect = trigger.value?.getBoundingClientRect()
@@ -38,6 +39,8 @@ function keyboard(event: KeyboardEvent) {
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
 }
 function detach() {
+  resizeObserver?.disconnect()
+  resizeObserver = undefined
   document.removeEventListener('pointerdown', outside, true)
   document.removeEventListener('keydown', keyboard, true)
   window.removeEventListener('resize', place)
@@ -49,6 +52,8 @@ watch(open, async value => {
   await nextTick()
   if (!open.value) return
   place()
+  resizeObserver = new ResizeObserver(place)
+  if (panel.value) resizeObserver.observe(panel.value)
   panel.value?.querySelector<HTMLElement>('button')?.focus()
   document.addEventListener('pointerdown', outside, true)
   document.addEventListener('keydown', keyboard, true)
@@ -56,14 +61,15 @@ watch(open, async value => {
   window.addEventListener('scroll', place, true)
 })
 watch(() => props.disabled, value => { if (value) close() })
+defineExpose({ close })
 onBeforeUnmount(detach)
 </script>
 
 <template>
   <button ref="trigger" type="button" class="generation-settings-trigger nodrag nowheel" :disabled="disabled"
-    :aria-label="label" :aria-expanded="open" :aria-controls="id" aria-haspopup="dialog"
+    :aria-label="label" :title="summary" :aria-expanded="open" :aria-controls="id" aria-haspopup="dialog"
     @pointerdown.stop @mousedown.stop @click.stop="open = !open">
-    <span class="settings-icon" aria-hidden="true">▭</span><span>{{ summary }}</span><span aria-hidden="true">⌃</span>
+    <span class="settings-icon" aria-hidden="true">{{ icon }}</span><span>{{ summary }}</span><span aria-hidden="true">⌃</span>
   </button>
   <Teleport to="body">
     <div v-if="open" :id="id" ref="panel" role="dialog" :aria-label="label" class="generation-settings-panel nodrag nowheel"

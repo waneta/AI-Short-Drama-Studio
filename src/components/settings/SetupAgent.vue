@@ -17,6 +17,7 @@ type FeedItem =
 const settings = useSettingsStore()
 const ready = computed(() => llmSetupReady())
 const llmLabel = computed(() => {
+  if (settings.config.assistantEngine === 'codex') return `Codex · ${settings.config.codexModel || '默认模型'}`
   const p = settings.config.llms.find((x) => x.id === settings.config.activeLlmId)
   if (!p) return '未配置'
   return p.model ? `${p.name} · ${p.model}` : p.name

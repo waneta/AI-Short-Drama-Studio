@@ -1,4 +1,11 @@
-/** Only known Token Plan API and Alibaba OSS result URLs use the local Web transport. */
+/** Known cloud API endpoints use fixed local Web transport; other destinations stay unchanged. */
+export const ARK_IMAGE_ORIGIN = 'https://ark.cn-beijing.volces.com'
+
+export function isArkImageApiUrl(url: URL): boolean {
+  return url.origin === ARK_IMAGE_ORIGIN && !url.username && !url.password && !url.search && !url.hash &&
+    /^\/api\/(?:plan\/)?v3\/images\/generations$/.test(url.pathname)
+}
+
 export const TOKEN_PLAN_ORIGIN = 'https://token-plan.cn-beijing.maas.aliyuncs.com'
 
 export function isTokenPlanApiUrl(url: URL): boolean {
@@ -15,6 +22,7 @@ export function tokenPlanWebProxyUrl(raw: string, enabled: boolean, desktop = fa
   if (!enabled || desktop) return raw
   try {
     const url = new URL(raw)
+    if (isArkImageApiUrl(url)) return `/ark-image-api${url.pathname}`
     if (isTokenPlanApiUrl(url)) return `/token-plan-api${url.pathname}${url.search}`
     if (isAlibabaResultUrl(url)) return `/token-plan-media?url=${encodeURIComponent(url.href)}`
   } catch { /* Other local and third-party URLs keep their existing transport. */ }

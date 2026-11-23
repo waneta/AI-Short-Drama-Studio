@@ -4,7 +4,11 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 const props = defineProps<{
   label?: string
   startedAt?: number
+  cancelable?: boolean
+  cancelling?: boolean
 }>()
+
+const emit = defineEmits<{ cancel: [] }>()
 
 const now = ref(performance.now())
 let timer: ReturnType<typeof setInterval> | undefined
@@ -36,7 +40,11 @@ const elapsed = computed(() => {
     <i class="bar" />
     <i class="scan" />
     <i class="ring" />
-    <span>{{ label || '生成中' }}<span v-if="elapsed" class="elapsed"> · 已耗时 {{ elapsed }}</span></span>
+    <span role="status" aria-live="polite">{{ cancelling ? '正在取消本次生成…' : label || '生成中' }}<span v-if="elapsed" class="elapsed"> · 已耗时 {{ elapsed }}</span></span>
+    <button v-if="cancelable" type="button" class="cancel-job nodrag nowheel"
+      :disabled="cancelling" @pointerdown.stop @mousedown.stop @dblclick.stop @click.stop="emit('cancel')">
+      {{ cancelling ? '正在取消…' : '取消本次' }}
+    </button>
   </div>
 </template>
 
@@ -68,6 +76,21 @@ const elapsed = computed(() => {
   line-height: 1.35;
   word-break: break-word;
 }
+.cancel-job {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
+  padding: 5px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 6px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  font: inherit;
+  cursor: pointer;
+}
+.cancel-job:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+.cancel-job:focus-visible { outline: 2px solid #7eb4ff; outline-offset: 2px; }
+.cancel-job:disabled { opacity: 0.6; cursor: wait; }
 .bar {
   position: absolute;
   top: 0;

@@ -1,3 +1,4 @@
+import { shotVideoNode } from '@/utils/videoStill'
 /**
  * 节点上展示的提示词 = 真正发给出图/出视频接口的全文。
  * 框里有字就原样发送，不再背后拼接。
@@ -127,7 +128,7 @@ export function shotVoiceBlock(shot: Shot, project: Project): string {
 }
 
 export function defaultVideoSendPrompt(shot: Shot, project: Project): string {
-  const packed = packVideoRefEntries(collectShotVideoEntries(shot, project))
+  const packed = packVideoRefEntries(collectShotVideoEntries(shot, project), 9, shotVideoNode(project, shot.id)?.data.videoReferenceOrder)
   const imageSlots = buildH3ImageSlots(packed)
   const spoken = spokenTextOnly(shot.voiceover || '')
   const roster = pictureIdentityBlock({ prompt: '', imageSlots, duration: shot.duration })

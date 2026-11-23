@@ -21,12 +21,13 @@ export type CanvasNodeType =
 /** 图生视频节点模型。默认 H3 15s；h3-v5 为 10 秒且可选 1080p；万相走百炼同一套 Key。 */
 export type VideoGenModel = 'h3' | 'h3-v5' | 'wan-prime'
 
-export type H3ImageResolution = 'auto' | '1mp' | '4mp' | '480p' | '720p' | '1080p' | '1440p' | '2160p' | '8mp' | '12mp' | '16mp' | '20mp' | 'custom'
+export type H3ImageResolution = 'seedream-1.5k' | 'auto' | '1mp' | '4mp' | '480p' | '720p' | '1080p' | '1440p' | '2160p' | '8mp' | '12mp' | '16mp' | '20mp' | 'custom'
 
-export type VideoResolution = '480p' | '720p' | '768p' | '1080p'
+export type VideoResolution = '480p' | '720p' | '736p' | '768p' | '1080p'
 
 /** H3 出片方式。reference=多图参考（当前默认）；fl2va=首尾帧。 */
 export type H3VideoGenMode = 'reference' | 'fl2va'
+export type VideoGenerationMode = 'text' | 'omni' | 'image' | 'first-last' | 'reference' | 'audio-sync'
 
 /**
  * 出视频前的参考图策略。必须在生成视频前按模型定好，画布是否铺「分镜关键帧」也跟它走。
@@ -116,12 +117,16 @@ export interface CanvasNode {
     subjectId?: string
     sceneId?: string
     shotId?: string
+    /** User rating, 0 clears the rating. */
+    rating?: number
     label?: string
     width?: number
     height?: number
     kind?: string
     prompt?: string
     referenceAssetIds?: string[]
+    /** Ordered image slots: node:<source ID> stays live; asset:<asset ID> is a manual reference. */
+    referenceImageOrder?: string[]
     /** Optional standalone sound conditioning, independent of image slots and output audio. */
     referenceAudioAssetId?: string
     referenceAudioAssetIds?: string[]
@@ -136,17 +141,25 @@ export interface CanvasNode {
     /** Node-bound image endpoint and API model; global settings only provide initial defaults. */
     imageProfileId?: string
     imageModel?: string
+    imageQuality?: string
+    imageCount?: number
+    /** Results from the most recent generation batch; outputAssetId chooses the visible one. */
+    outputAssetIds?: string[]
     generationSeed?: number
-    /** Image output dimensions; H3 uses a minimum 4MP generation canvas before resizing. */
+    /** Image output dimensions; explicit H3 presets set the inference canvas. */
     imageResolution?: H3ImageResolution
     imageWidth?: number
     imageHeight?: number
+    videoGenerationMode?: VideoGenerationMode
+    videoCount?: number
     videoModel?: VideoGenModel
     /** 当前节点锁定的视频接入，避免不同供应商配置互相串用。 */
     videoProfileId?: string
     /** 这一镜出视频时用什么参考图；切模型时写入，决定画布是否铺分镜关键帧 */
     videoStillMode?: VideoStillMode
-    /** 原生H3：480p/720p/1080p；云端h3-v5：768p/1080p。 */
+    /** Wan3视频自适应画幅；保留aspectRatio作为固定比例与画布预览回退。 */
+    videoAspectAuto?: boolean
+    /** 原生H3与Wan3：480p/720p/1080p；云端h3-v5：768p/1080p。 */
     videoResolution?: VideoResolution
     /** 原生H3输出音轨；缺省开启。关闭不改变音视频联合采样。 */
     videoAudioEnabled?: boolean
